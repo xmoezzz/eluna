@@ -1,0 +1,17 @@
+[package]
+name = "eluna_player"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Minimal winit + wgpu preview player for eluna"
+
+[dependencies]
+eluna = { path = "../eluna" }
+bytemuck = { version = "1.22", features = ["derive"] }
+pollster = "0.4.0"
+wgpu = "29.0.3"
+winit = "0.30.13"
+image = { version = "0.25", default-features = true }
+egui = "0.34.2"
+egui-wgpu = "0.34.2"
+egui-winit = "0.34.2"

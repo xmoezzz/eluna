@@ -68,6 +68,7 @@ impl EmoteTextureIcon {
 pub struct EmoteMeshPatch {
     pub division_x: u32,
     pub division_y: u32,
+    pub domain: Option<[f32; 4]>,
     /// Sixteen cubic Bezier patch control points, row-major, each point in
     /// normalized local sprite space. The identity patch is
     /// `(col / 3, row / 3)`.
@@ -86,6 +87,7 @@ impl EmoteMeshPatch {
         Self {
             division_x: division_x.max(1),
             division_y: division_y.max(1),
+            domain: None,
             control_points,
         }
     }
@@ -106,29 +108,39 @@ impl EmoteMeshPatch {
     }
 
     pub fn combined_with(&self, next: &EmoteMeshPatch) -> EmoteMeshPatch {
-        let identity = EmoteMeshPatch::identity(
-            self.division_x.max(next.division_x),
-            self.division_y.max(next.division_y),
-        );
-        let mut out = identity.clone();
+        let division_x = self.division_x.max(next.division_x);
+        let division_y = self.division_y.max(next.division_y);
+        let mut out = EmoteMeshPatch::identity(division_x, division_y);
         for i in 0..16 {
-            out.control_points[i][0] = identity.control_points[i][0]
-                + (self.control_points[i][0] - identity.control_points[i][0])
-                + (next.control_points[i][0] - identity.control_points[i][0]);
-            out.control_points[i][1] = identity.control_points[i][1]
-                + (self.control_points[i][1] - identity.control_points[i][1])
-                + (next.control_points[i][1] - identity.control_points[i][1]);
+            let p = self.control_points[i];
+            out.control_points[i] = next.sample(p[0], p[1]);
         }
+        out.domain = self.domain.or(next.domain);
         out
     }
 
     pub fn interpolate(a: &EmoteMeshPatch, b: &EmoteMeshPatch, t: f32) -> EmoteMeshPatch {
         let t = t.clamp(0.0, 1.0);
-        let mut out = EmoteMeshPatch::identity(a.division_x.max(b.division_x), a.division_y.max(b.division_y));
+        let mut out = EmoteMeshPatch::identity(
+            a.division_x.max(b.division_x),
+            a.division_y.max(b.division_y),
+        );
         for i in 0..16 {
-            out.control_points[i][0] = a.control_points[i][0] + (b.control_points[i][0] - a.control_points[i][0]) * t;
-            out.control_points[i][1] = a.control_points[i][1] + (b.control_points[i][1] - a.control_points[i][1]) * t;
+            out.control_points[i][0] =
+                a.control_points[i][0] + (b.control_points[i][0] - a.control_points[i][0]) * t;
+            out.control_points[i][1] =
+                a.control_points[i][1] + (b.control_points[i][1] - a.control_points[i][1]) * t;
         }
+        out.domain = match (a.domain, b.domain) {
+            (Some(a), Some(b)) => Some([
+                lerp(a[0], b[0], t),
+                lerp(a[1], b[1], t),
+                lerp(a[2], b[2], t),
+                lerp(a[3], b[3], t),
+            ]),
+            (Some(domain), None) | (None, Some(domain)) => Some(domain),
+            (None, None) => None,
+        };
         out
     }
 
@@ -158,6 +170,17 @@ pub struct EmoteStaticScene {
     pub sprites: Vec<EmoteStaticSprite>,
     pub bounds: Option<EmoteSceneBounds>,
     pub draw_frame_info: Vec<EmoteDrawFrameInfo>,
+    pub layer_states: Vec<EmoteStepFrameLayerState>,
+    /// Composite-mask owners encountered during traversal, keyed by the owner
+    /// layer's full path.  Value is the list of resolved source-layer paths
+    /// taken from `stencilCompositeMaskLayerList` on that owner.
+    ///
+    /// Source of truth: `sub_103390C0` lines 407-528 (the second pass).  The
+    /// owner is a layer with `stencilType & 4` and the source list is read
+    /// from the OWNER, not inherited into descendants.  The renderer keys
+    /// alpha-mask references by owner path; descendants whose
+    /// `parent_mask_path` equals an owner path sample that owner's mask.
+    pub composite_mask_owners: BTreeMap<String, Vec<String>>,
 }
 
 impl EmoteStaticScene {
@@ -166,7 +189,8 @@ impl EmoteStaticScene {
     /// This is a preview helper. The original runtime motion selection still
     /// needs the `FindMotion` / timeline code path from the DLL.
     pub fn filter_motion(mut self, motion_name: &str) -> Self {
-        self.sprites.retain(|sprite| sprite.motion_name == motion_name);
+        self.sprites
+            .retain(|sprite| sprite.motion_name == motion_name);
         self.bounds = compute_bounds(&self.sprites);
         self
     }
@@ -190,7 +214,10 @@ impl EmoteSceneBounds {
     }
 
     pub fn center(self) -> [f32; 2] {
-        [(self.min_x + self.max_x) * 0.5, (self.min_y + self.max_y) * 0.5]
+        [
+            (self.min_x + self.max_x) * 0.5,
+            (self.min_y + self.max_y) * 0.5,
+        ]
     }
 
     fn include_rect(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
@@ -235,6 +262,9 @@ pub struct EmoteDrawFrameInfo {
     pub layer_label: Option<String>,
     pub draw_index: usize,
     pub path: String,
+    pub layer_type: i64,
+    pub ready_to_draw: bool,
+    pub submitted_to_draw_frame: bool,
     pub mesh_transform: i64,
     pub mesh_combine: bool,
     pub mesh_sync_child_mask: i64,
@@ -252,7 +282,11 @@ pub struct EmoteDrawFrameInfo {
     pub coordinate: Option<i64>,
     pub ground_correction: Option<i64>,
     pub stencil_type: i64,
+    pub stencil_phase: i64,
+    pub stencil_composite_item: bool,
     pub stencil_composite_mask_layer_list: Vec<String>,
+    pub stencil_composite_target_paths: Vec<String>,
+    pub parent_mask_path: Option<String>,
     pub control_parameter: Option<String>,
     pub control_value: Option<f32>,
     pub local_time_ticks: Option<f32>,
@@ -328,9 +362,9 @@ impl EmoteStaticSprite {
 
     pub fn bounds_rect(&self) -> (f32, f32, f32, f32) {
         let (left, top, right, bottom) = if let Some(mesh) = &self.mesh {
+            let (min_u, min_v, max_u, max_v) = mesh.control_bounds();
             let left = self.left();
             let top = self.top();
-            let (min_u, min_v, max_u, max_v) = mesh.control_bounds();
             (
                 left + min_u * self.width,
                 top + min_v * self.height,
@@ -344,7 +378,13 @@ impl EmoteStaticSprite {
     }
 }
 
-fn bounds_after_sprite_transform(sprite: &EmoteStaticSprite, left: f32, top: f32, right: f32, bottom: f32) -> (f32, f32, f32, f32) {
+fn bounds_after_sprite_transform(
+    sprite: &EmoteStaticSprite,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> (f32, f32, f32, f32) {
     let points = [
         transform_emote_sprite_point(sprite, [left, top]),
         transform_emote_sprite_point(sprite, [left, bottom]),
@@ -414,22 +454,38 @@ impl Error for EmoteSchemaError {}
 
 impl EmoteModelSchema {
     pub fn from_psb(psb: &PsbFile) -> Result<Self, EmoteSchemaError> {
-        let root = psb.root.as_object().ok_or(EmoteSchemaError::RootIsNotObject)?;
+        let root = psb
+            .root
+            .as_object()
+            .ok_or(EmoteSchemaError::RootIsNotObject)?;
         let root_value = PsbValue::Object(root.to_vec());
-        let object = root_value.field("object").ok_or(EmoteSchemaError::MissingObjectTable)?;
-        let source = root_value.field("source").ok_or(EmoteSchemaError::MissingSourceTable)?;
+        let object = root_value
+            .field("object")
+            .ok_or(EmoteSchemaError::MissingObjectTable)?;
+        let source = root_value
+            .field("source")
+            .ok_or(EmoteSchemaError::MissingSourceTable)?;
 
         let base_object = find_base_object(&root_value, object)?;
         let spec = root_value.field_str("spec").map(str::to_owned);
         let textures = collect_textures(source)?;
 
-        Ok(Self { base_object, spec, textures })
+        Ok(Self {
+            base_object,
+            spec,
+            textures,
+        })
     }
 
     pub fn motion_infos(&self, psb: &PsbFile) -> Result<Vec<EmoteMotionInfo>, EmoteSchemaError> {
-        let root = psb.root.as_object().ok_or(EmoteSchemaError::RootIsNotObject)?;
+        let root = psb
+            .root
+            .as_object()
+            .ok_or(EmoteSchemaError::RootIsNotObject)?;
         let root_value = PsbValue::Object(root.to_vec());
-        let object_table = root_value.field("object").ok_or(EmoteSchemaError::MissingObjectTable)?;
+        let object_table = root_value
+            .field("object")
+            .ok_or(EmoteSchemaError::MissingObjectTable)?;
         let base = object_table
             .field(&self.base_object)
             .ok_or(EmoteSchemaError::MissingBaseObject)?;
@@ -448,7 +504,11 @@ impl EmoteModelSchema {
     }
 
     pub fn default_motion_name(&self, psb: &PsbFile) -> Result<Option<String>, EmoteSchemaError> {
-        Ok(self.motion_infos(psb)?.into_iter().next().map(|info| info.name))
+        Ok(self
+            .motion_infos(psb)?
+            .into_iter()
+            .next()
+            .map(|info| info.name))
     }
 
     pub fn build_motion_scene_at(
@@ -489,9 +549,14 @@ impl EmoteModelSchema {
         time_ticks: f32,
         variables: &BTreeMap<String, f32>,
     ) -> Result<EmoteStaticScene, EmoteSchemaError> {
-        let root = psb.root.as_object().ok_or(EmoteSchemaError::RootIsNotObject)?;
+        let root = psb
+            .root
+            .as_object()
+            .ok_or(EmoteSchemaError::RootIsNotObject)?;
         let root_value = PsbValue::Object(root.to_vec());
-        let object_table = root_value.field("object").ok_or(EmoteSchemaError::MissingObjectTable)?;
+        let object_table = root_value
+            .field("object")
+            .ok_or(EmoteSchemaError::MissingObjectTable)?;
         let root_parameter_table = root_value.field("parameter").and_then(PsbValue::as_list);
         let base = object_table
             .field(&self.base_object)
@@ -508,34 +573,59 @@ impl EmoteModelSchema {
         let duration = motion_duration_ticks(motion).unwrap_or(0.0);
         let effective_time = wrap_motion_time(time_ticks, duration);
         let mut sprites = Vec::new();
+        let mut layer_states = Vec::new();
+        let mut mask_owners = BTreeMap::<String, Vec<String>>::new();
         for (index, layer) in layers.iter().enumerate() {
             travel_layer_at(
                 layer,
                 object_table,
-                motion.field("parameter").and_then(PsbValue::as_list).or(root_parameter_table),
+                motion
+                    .field("parameter")
+                    .and_then(PsbValue::as_list)
+                    .or(root_parameter_table),
                 psb,
                 psb_data,
                 variables,
                 &self.textures,
                 motion_name,
                 effective_time,
-                TravelContext { draw_index: index, ..TravelContext::default() },
+                TravelContext {
+                    draw_index: index,
+                    priority_ranks: motion_priority_ranks(motion, effective_time),
+                    ..TravelContext::default()
+                },
                 &mut sprites,
+                &mut layer_states,
+                &mut mask_owners,
             )?;
         }
-        Ok(finalize_scene(self.base_object.clone(), sprites))
+        Ok(finalize_scene(
+            self.base_object.clone(),
+            sprites,
+            layer_states,
+            mask_owners,
+        ))
     }
 
     pub fn build_static_scene(&self, psb: &PsbFile) -> Result<EmoteStaticScene, EmoteSchemaError> {
-        let root = psb.root.as_object().ok_or(EmoteSchemaError::RootIsNotObject)?;
+        let root = psb
+            .root
+            .as_object()
+            .ok_or(EmoteSchemaError::RootIsNotObject)?;
         let root_value = PsbValue::Object(root.to_vec());
-        let object_table = root_value.field("object").ok_or(EmoteSchemaError::MissingObjectTable)?;
+        let object_table = root_value
+            .field("object")
+            .ok_or(EmoteSchemaError::MissingObjectTable)?;
         let base = object_table
             .field(&self.base_object)
             .ok_or(EmoteSchemaError::MissingBaseObject)?;
-        let motion_table = base.field("motion").ok_or(EmoteSchemaError::MissingBaseObject)?;
+        let motion_table = base
+            .field("motion")
+            .ok_or(EmoteSchemaError::MissingBaseObject)?;
 
         let mut sprites = Vec::new();
+        let mut layer_states = Vec::new();
+        let mut mask_owners = BTreeMap::<String, Vec<String>>::new();
         if let Some(motions) = motion_table.as_object() {
             for (motion_name, motion) in motions {
                 if let Some(layers) = motion.field("layer").and_then(PsbValue::as_list) {
@@ -546,34 +636,234 @@ impl EmoteModelSchema {
                             object_table,
                             &self.textures,
                             motion_name,
-                            TravelContext { draw_index: index, ..ctx.clone() },
+                            TravelContext {
+                                draw_index: index,
+                                priority_ranks: motion_priority_ranks(motion, 0.0),
+                                ..ctx.clone()
+                            },
                             &mut sprites,
+                            &mut layer_states,
+                            &mut mask_owners,
                         )?;
                     }
                 }
             }
         }
 
-        Ok(finalize_scene(self.base_object.clone(), sprites))
+        Ok(finalize_scene(
+            self.base_object.clone(),
+            sprites,
+            layer_states,
+            mask_owners,
+        ))
     }
 }
 
-fn finalize_scene(base_object: String, mut sprites: Vec<EmoteStaticSprite>) -> EmoteStaticScene {
-    sprites.sort_by(|a, b| a.z.total_cmp(&b.z).then(a.draw_frame_info.draw_index.cmp(&b.draw_frame_info.draw_index)));
+fn finalize_scene(
+    base_object: String,
+    mut sprites: Vec<EmoteStaticSprite>,
+    mut layer_states: Vec<EmoteStepFrameLayerState>,
+    mask_owners_raw: BTreeMap<String, Vec<String>>,
+) -> EmoteStaticScene {
+    // sub_103390C0 emits drawFrameInfo from the model priority/layer traversal
+    // stream while layer coordinate z still separates broad visual planes.
+    // Bucket z to the authored integer plane first, then use
+    // priorityFrameList/layerIndexMap inside that plane.  This keeps face/hair
+    // planes from covering each other incorrectly while allowing paired
+    // same-plane meshes such as legs to follow the recovered priority order.
+    sprites.sort_by(|a, b| {
+        (a.z.round() as i32)
+            .cmp(&(b.z.round() as i32))
+            .then_with(|| {
+                a.draw_frame_info
+                    .draw_index
+                    .cmp(&b.draw_frame_info.draw_index)
+            })
+            .then_with(|| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.draw_frame_info.path.cmp(&b.draw_frame_info.path))
+    });
     for (index, sprite) in sprites.iter_mut().enumerate() {
         sprite.draw_frame_info.draw_index = index;
     }
+    resolve_draw_frame_composite_links(&mut sprites);
+    let composite_mask_owners = resolve_composite_mask_owners(&sprites, &mask_owners_raw);
     let bounds = compute_bounds(&sprites);
-    let draw_frame_info = sprites.iter().map(|sprite| sprite.draw_frame_info.clone()).collect();
+    let draw_frame_info = sprites
+        .iter()
+        .map(|sprite| sprite.draw_frame_info.clone())
+        .collect();
+    layer_states.sort_by(|a, b| a.path.cmp(&b.path));
     EmoteStaticScene {
         base_object,
         sprites,
         bounds,
         draw_frame_info,
+        layer_states,
+        composite_mask_owners,
     }
 }
 
-pub fn load_emote_static_scene(psb: &PsbFile) -> Result<(EmoteModelSchema, EmoteStaticScene), EmoteSchemaError> {
+/// Resolves the per-owner `stencilCompositeMaskLayerList` entries into actual
+/// sprite paths.  Owner key is the full layer-path of the
+/// `stencilType & 4` layer (the type-3 mask owner per `sub_103390C0` second
+/// pass).  Each owner's source list comes from its OWN PSB field, not from any
+/// ancestor — that is the bug `enter_layer_context` previously had where the
+/// field was inherited through traversal context.
+fn resolve_composite_mask_owners(
+    sprites: &[EmoteStaticSprite],
+    raw: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let path_and_label: Vec<(String, Option<String>)> = sprites
+        .iter()
+        .map(|sprite| {
+            (
+                sprite.draw_frame_info.path.clone(),
+                sprite.draw_frame_info.layer_label.clone(),
+            )
+        })
+        .collect();
+
+    let mut out = BTreeMap::new();
+    for (owner_path, references) in raw {
+        let mut resolved = Vec::new();
+        for reference in references {
+            // Pass the owner's path so the resolver can disambiguate symmetric
+            // siblings like the two `shirome` layers (one under ■目R, one under
+            // ■目L).  Without an owner anchor, suffix matching grabs both.
+            for resolved_path in
+                resolve_layer_reference_with_owner(reference, owner_path, &path_and_label)
+            {
+                if !resolved.contains(&resolved_path) {
+                    resolved.push(resolved_path);
+                }
+            }
+        }
+        out.insert(owner_path.clone(), resolved);
+    }
+    out
+}
+
+/// Resolves a `stencilCompositeMaskLayerList` reference relative to its owner
+/// layer.  When multiple sprites match by suffix/label, the one whose path
+/// shares the longest prefix with `owner_path` wins.  This mirrors how the
+/// engine's `sub_101A0929`-populated owner table walks the layer tree from
+/// the owner outward (closest sibling-subtree first), rather than a global
+/// label index.
+fn resolve_layer_reference_with_owner(
+    reference: &str,
+    owner_path: &str,
+    candidates: &[(String, Option<String>)],
+) -> Vec<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Vec::new();
+    }
+
+    // Exact match (path or layer_label).  If any candidate matches exactly,
+    // narrow to those before considering owner proximity.
+    let mut exact: Vec<&(String, Option<String>)> = candidates
+        .iter()
+        .filter(|(path, label)| path == reference || label.as_deref() == Some(reference))
+        .collect();
+    if exact.is_empty() {
+        let suffix = format!("/{reference}");
+        exact = candidates
+            .iter()
+            .filter(|(path, _)| path.ends_with(&suffix))
+            .collect();
+    }
+    if exact.is_empty() {
+        return Vec::new();
+    }
+    if exact.len() == 1 {
+        return vec![exact[0].0.clone()];
+    }
+
+    // Pick the candidate with the longest shared path prefix with the owner.
+    // Prefix lengths are computed segment by segment so that
+    // `…/■目R/le` shares 2 segments with `…/■目R/le/eye_sp/...` but only
+    // 1 with `…/■目L/...`.
+    let owner_segs: Vec<&str> = owner_path.split('/').collect();
+    let mut best_score: usize = 0;
+    let mut best_path: Option<&String> = None;
+    for (path, _label) in &exact {
+        let cand_segs: Vec<&str> = path.split('/').collect();
+        let mut score = 0;
+        for (a, b) in owner_segs.iter().zip(cand_segs.iter()) {
+            if a == b {
+                score += 1;
+            } else {
+                break;
+            }
+        }
+        if score > best_score || best_path.is_none() {
+            best_score = score;
+            best_path = Some(path);
+        }
+    }
+    best_path.map(|p| vec![p.clone()]).unwrap_or_default()
+}
+
+fn resolve_draw_frame_composite_links(sprites: &mut [EmoteStaticSprite]) {
+    let path_and_label: Vec<(String, Option<String>)> = sprites
+        .iter()
+        .map(|sprite| {
+            (
+                sprite.draw_frame_info.path.clone(),
+                sprite.draw_frame_info.layer_label.clone(),
+            )
+        })
+        .collect();
+
+    for sprite in sprites.iter_mut() {
+        if sprite
+            .draw_frame_info
+            .stencil_composite_mask_layer_list
+            .is_empty()
+        {
+            continue;
+        }
+        let mut resolved = Vec::new();
+        for raw in &sprite.draw_frame_info.stencil_composite_mask_layer_list {
+            for path in resolve_draw_frame_layer_reference(raw, &path_and_label) {
+                if !resolved.contains(&path) {
+                    resolved.push(path);
+                }
+            }
+        }
+        sprite.draw_frame_info.stencil_composite_target_paths = resolved;
+    }
+}
+
+fn resolve_draw_frame_layer_reference(
+    reference: &str,
+    candidates: &[(String, Option<String>)],
+) -> Vec<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Vec::new();
+    }
+
+    let mut exact = Vec::new();
+    for (path, label) in candidates {
+        if path == reference || label.as_deref() == Some(reference) {
+            exact.push(path.clone());
+        }
+    }
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let suffix = format!("/{reference}");
+    candidates
+        .iter()
+        .filter_map(|(path, _)| path.ends_with(&suffix).then(|| path.clone()))
+        .collect()
+}
+
+pub fn load_emote_static_scene(
+    psb: &PsbFile,
+) -> Result<(EmoteModelSchema, EmoteStaticScene), EmoteSchemaError> {
     let schema = EmoteModelSchema::from_psb(psb)?;
     let scene = schema.build_static_scene(psb)?;
     Ok((schema, scene))
@@ -601,7 +891,9 @@ fn find_base_object(root: &PsbValue, object_table: &PsbValue) -> Result<String, 
     Ok(first)
 }
 
-fn collect_textures(source: &PsbValue) -> Result<BTreeMap<String, EmoteTextureSource>, EmoteSchemaError> {
+fn collect_textures(
+    source: &PsbValue,
+) -> Result<BTreeMap<String, EmoteTextureSource>, EmoteSchemaError> {
     let mut textures = BTreeMap::new();
     let Some(entries) = source.as_object() else {
         return Ok(textures);
@@ -615,11 +907,19 @@ fn collect_textures(source: &PsbValue) -> Result<BTreeMap<String, EmoteTextureSo
             .field_u32("pixel")
             .or_else(|| texture.field_u32("data"))
             .or_else(|| texture.field_u32("resource"))
-            .ok_or_else(|| EmoteSchemaError::InvalidTextureResource { source: name.clone() })?;
-        let width = number_to_positive_u32(texture.field("width"))
-            .ok_or_else(|| EmoteSchemaError::InvalidSourceTexture { source: name.clone() })?;
-        let height = number_to_positive_u32(texture.field("height"))
-            .ok_or_else(|| EmoteSchemaError::InvalidSourceTexture { source: name.clone() })?;
+            .ok_or_else(|| EmoteSchemaError::InvalidTextureResource {
+                source: name.clone(),
+            })?;
+        let width = number_to_positive_u32(texture.field("width")).ok_or_else(|| {
+            EmoteSchemaError::InvalidSourceTexture {
+                source: name.clone(),
+            }
+        })?;
+        let height = number_to_positive_u32(texture.field("height")).ok_or_else(|| {
+            EmoteSchemaError::InvalidSourceTexture {
+                source: name.clone(),
+            }
+        })?;
         let format = texture.field_str("type").map(str::to_owned);
         let compress = texture.field_str("compress").map(str::to_owned);
         let bit_count = texture.field_u32("bitCount");
@@ -627,30 +927,33 @@ fn collect_textures(source: &PsbValue) -> Result<BTreeMap<String, EmoteTextureSo
         let mut icons = BTreeMap::new();
         if let Some(icon_entries) = value.field("icon").and_then(PsbValue::as_object) {
             for (icon_name, icon_value) in icon_entries {
-                let left = icon_value
-                    .field_f32("left")
-                    .ok_or_else(|| EmoteSchemaError::InvalidIcon {
+                let left =
+                    icon_value
+                        .field_f32("left")
+                        .ok_or_else(|| EmoteSchemaError::InvalidIcon {
+                            source: name.clone(),
+                            icon: icon_name.clone(),
+                        })?;
+                let top =
+                    icon_value
+                        .field_f32("top")
+                        .ok_or_else(|| EmoteSchemaError::InvalidIcon {
+                            source: name.clone(),
+                            icon: icon_name.clone(),
+                        })?;
+                let width =
+                    icon_value
+                        .field_f32("width")
+                        .ok_or_else(|| EmoteSchemaError::InvalidIcon {
+                            source: name.clone(),
+                            icon: icon_name.clone(),
+                        })?;
+                let height = icon_value.field_f32("height").ok_or_else(|| {
+                    EmoteSchemaError::InvalidIcon {
                         source: name.clone(),
                         icon: icon_name.clone(),
-                    })?;
-                let top = icon_value
-                    .field_f32("top")
-                    .ok_or_else(|| EmoteSchemaError::InvalidIcon {
-                        source: name.clone(),
-                        icon: icon_name.clone(),
-                    })?;
-                let width = icon_value
-                    .field_f32("width")
-                    .ok_or_else(|| EmoteSchemaError::InvalidIcon {
-                        source: name.clone(),
-                        icon: icon_name.clone(),
-                    })?;
-                let height = icon_value
-                    .field_f32("height")
-                    .ok_or_else(|| EmoteSchemaError::InvalidIcon {
-                        source: name.clone(),
-                        icon: icon_name.clone(),
-                    })?;
+                    }
+                })?;
                 let resolution = icon_value.field_f32("resolution").unwrap_or(1.0);
                 icons.insert(
                     icon_name.clone(),
@@ -692,7 +995,6 @@ fn number_to_positive_u32(value: Option<&PsbValue>) -> Option<u32> {
     let n = value?.as_i64()?;
     (n > 0 && n <= u32::MAX as i64).then_some(n as u32)
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct EmoteTransform2D {
@@ -764,7 +1066,11 @@ impl EmoteTransform2D {
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
-    if value.is_finite() { value } else { fallback }
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
 }
 
 fn transform_from_array(values: [f32; 6]) -> EmoteTransform2D {
@@ -786,6 +1092,9 @@ struct TravelContext {
     transform: EmoteTransform2D,
     path: String,
     draw_index: usize,
+    draw_order_base: usize,
+    priority_ranks: BTreeMap<String, usize>,
+    layer_type: i64,
     mesh_transform: i64,
     mesh_combine: bool,
     mesh_sync_child: i64,
@@ -796,6 +1105,7 @@ struct TravelContext {
     ground_correction: Option<i64>,
     stencil_type: i64,
     stencil_composite_mask_layer_list: Vec<String>,
+    parent_mask_path: Option<String>,
     control_parameter: Option<String>,
     control_value: Option<f32>,
     local_time_ticks: Option<f32>,
@@ -805,6 +1115,7 @@ struct TravelContext {
     mesh_division_x: u32,
     mesh_division_y: u32,
     mesh_patch: Option<EmoteMeshPatch>,
+    mesh_parameters: BTreeSet<String>,
 }
 
 impl Default for TravelContext {
@@ -816,6 +1127,9 @@ impl Default for TravelContext {
             transform: EmoteTransform2D::identity(),
             path: String::new(),
             draw_index: 0,
+            draw_order_base: 0,
+            priority_ranks: BTreeMap::new(),
+            layer_type: 0,
             mesh_transform: 0,
             mesh_combine: false,
             mesh_sync_child: 0,
@@ -826,6 +1140,7 @@ impl Default for TravelContext {
             ground_correction: None,
             stencil_type: 0,
             stencil_composite_mask_layer_list: Vec::new(),
+            parent_mask_path: None,
             control_parameter: None,
             control_value: None,
             local_time_ticks: None,
@@ -835,48 +1150,59 @@ impl Default for TravelContext {
             mesh_division_x: 1,
             mesh_division_y: 1,
             mesh_patch: None,
+            mesh_parameters: BTreeSet::new(),
         }
     }
 }
 
-fn enter_layer_context(mut ctx: TravelContext, layer: &PsbValue, sibling_index: usize) -> TravelContext {
+fn enter_layer_context(
+    mut ctx: TravelContext,
+    layer: &PsbValue,
+    sibling_index: usize,
+) -> TravelContext {
     let label = layer
         .field_str("label")
         .map(str::to_owned)
         .unwrap_or_else(|| sibling_index.to_string());
     ctx.path = if ctx.path.is_empty() {
-        label
+        label.clone()
     } else {
         format!("{}/{}", ctx.path, label)
     };
-    if let Some(v) = layer.field_i64("meshTransform") {
-        ctx.mesh_transform = v;
-    }
-    if let Some(v) = layer.field_i64("meshCombine") {
-        ctx.mesh_combine = v != 0;
-    }
-    if let Some(v) = layer.field_i64("meshSyncChildMask") {
-        ctx.mesh_sync_child = v;
-    }
-    if let Some(v) = layer.field_i64("joinTarget") {
-        ctx.join_target = Some(v);
-    }
-    if let Some(v) = layer.field_i64("inheritMask") {
-        ctx.inherit_mask = Some(v);
-    }
-    if let Some(v) = layer.field_i64("coordinate") {
-        ctx.coordinate = Some(v);
-    }
-    if let Some(v) = layer.field_i64("groundCorrection") {
-        ctx.ground_correction = Some(v);
-    }
-    if let Some(v) = layer.field_i64("stencilType") {
-        ctx.stencil_type = v;
-    }
-    if let Some(values) = layer.field("transformOrder").and_then(PsbValue::as_list) {
-        ctx.transform_order = values.iter().filter_map(PsbValue::as_i64).collect();
-    }
-    if let Some(values) = layer.field("stencilCompositeMaskLayerList").and_then(PsbValue::as_list) {
+    let order_component = ctx
+        .priority_ranks
+        .get(&label)
+        .copied()
+        .unwrap_or(sibling_index);
+    ctx.draw_index = ctx.draw_order_base.saturating_add(order_component);
+    // Layer-local fields: these are intrinsic to the layer currently entered
+    // and must NOT inherit from the parent's traversal context.  The original
+    // engine reads them from `layerInfo + offset` directly per layer (see
+    // sub_1033ED90 field offsets and sub_103390C0 / sub_10353CF0 consumers).
+    // Resetting here is structurally important for stencilType and
+    // stencilCompositeMaskLayerList in particular: sub_103390C0 second pass
+    // (lines 407-528) reads `*(v91 + 720) & 4` and `*(v91 + 740) + 8` on the
+    // OWNER, never from an ancestor context.  Inheriting these fields makes
+    // a descendant accidentally take on its ancestor's mask-owner role.
+    ctx.layer_type = layer.field_i64("type").unwrap_or(0);
+    ctx.mesh_transform = layer.field_i64("meshTransform").unwrap_or(0);
+    ctx.mesh_combine = layer.field_i64("meshCombine").unwrap_or(0) != 0;
+    ctx.mesh_sync_child = layer.field_i64("meshSyncChildMask").unwrap_or(0);
+    ctx.join_target = layer.field_i64("joinTarget");
+    ctx.inherit_mask = layer.field_i64("inheritMask");
+    ctx.coordinate = layer.field_i64("coordinate");
+    ctx.ground_correction = layer.field_i64("groundCorrection");
+    ctx.stencil_type = layer.field_i64("stencilType").unwrap_or(0);
+    ctx.transform_order = layer
+        .field("transformOrder")
+        .and_then(PsbValue::as_list)
+        .map(|values| values.iter().filter_map(PsbValue::as_i64).collect())
+        .unwrap_or_default();
+    ctx.stencil_composite_mask_layer_list = Vec::new();
+    if let Some(values) = layer
+        .field("stencilCompositeMaskLayerList")
+        .and_then(PsbValue::as_list)
+    {
         ctx.stencil_composite_mask_layer_list = values
             .iter()
             .filter_map(PsbValue::as_str)
@@ -893,10 +1219,16 @@ fn enter_layer_context(mut ctx: TravelContext, layer: &PsbValue, sibling_index: 
 fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameInfo {
     let mesh_sync_child_mask = ctx.mesh_sync_child;
     let inherit_mask = ctx.inherit_mask.unwrap_or(0);
-    let pass = if ctx.stencil_type != 0 && !ctx.stencil_composite_mask_layer_list.is_empty() {
+    let stencil_phase = ctx.stencil_type & 0x3;
+    let stencil_composite_item =
+        (ctx.stencil_type & 0x4) != 0 || !ctx.stencil_composite_mask_layer_list.is_empty();
+    let mask_layer = is_drawframe_mask_context(&ctx);
+    let pass = if mask_layer && stencil_composite_item {
         EmoteDrawPass::StencilCompositeMask
-    } else if ctx.stencil_type != 0 {
+    } else if mask_layer {
         EmoteDrawPass::MaskGeneration
+    } else if ctx.parent_mask_path.is_some() {
+        EmoteDrawPass::Filtered
     } else {
         EmoteDrawPass::Normal
     };
@@ -904,6 +1236,9 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
         layer_label: label,
         draw_index: ctx.draw_index,
         path: ctx.path,
+        layer_type: ctx.layer_type,
+        ready_to_draw: true,
+        submitted_to_draw_frame: true,
         mesh_transform: ctx.mesh_transform,
         mesh_combine: ctx.mesh_combine,
         mesh_sync_child_mask,
@@ -921,7 +1256,11 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
         coordinate: ctx.coordinate,
         ground_correction: ctx.ground_correction,
         stencil_type: ctx.stencil_type,
+        stencil_phase,
+        stencil_composite_item,
         stencil_composite_mask_layer_list: ctx.stencil_composite_mask_layer_list,
+        stencil_composite_target_paths: Vec::new(),
+        parent_mask_path: ctx.parent_mask_path,
         control_parameter: ctx.control_parameter,
         control_value: ctx.control_value,
         local_time_ticks: ctx.local_time_ticks,
@@ -932,6 +1271,19 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
     }
 }
 
+fn layer_state_from_ctx(label: Option<String>, ctx: &TravelContext) -> EmoteStepFrameLayerState {
+    let mut info = draw_frame_info(label, ctx.clone());
+    info.ready_to_draw = false;
+    info.submitted_to_draw_frame = false;
+    EmoteStepFrameLayerState {
+        path: ctx.path.clone(),
+        transform: ctx.transform.as_array(),
+        opacity: ctx.opacity_multiplier,
+        visible: ctx.base_visible && ctx.opacity_multiplier > 0.0,
+        draw_frame_info: info,
+    }
+}
+
 fn travel_layer(
     value: &PsbValue,
     object_table: &PsbValue,
@@ -939,6 +1291,8 @@ fn travel_layer(
     motion_name: &str,
     mut ctx: TravelContext,
     out: &mut Vec<EmoteStaticSprite>,
+    layer_states: &mut Vec<EmoteStepFrameLayerState>,
+    mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
     let Some(fields) = value.as_object() else {
         return Ok(());
@@ -946,9 +1300,21 @@ fn travel_layer(
     let layer = PsbValue::Object(fields.to_vec());
 
     ctx = enter_layer_context(ctx, &layer, out.len());
+    let label = layer.field_str("label").map(str::to_owned);
+    let current_stencil_phase = ctx.stencil_type & 0x3;
+    let current_composite_item =
+        (ctx.stencil_type & 0x4) != 0 || !ctx.stencil_composite_mask_layer_list.is_empty();
+    // sub_103390C0 second pass treats a layer as a composite-mask owner when
+    // (layerInfo+720) & 4 is set.  Record this layer's path and source list so
+    // descendants whose `parent_mask_path` matches can resolve the
+    // corresponding mask reference at draw-stream construction time.
+    if (ctx.stencil_type & 0x4) != 0 && !ctx.stencil_composite_mask_layer_list.is_empty() {
+        mask_owners
+            .entry(ctx.path.clone())
+            .or_insert_with(|| ctx.stencil_composite_mask_layer_list.clone());
+    }
 
     if let Some(frame_list) = layer.field("frameList").and_then(PsbValue::as_list) {
-        let label = layer.field_str("label").map(str::to_owned);
         let mut local_ox = 0.0;
         let mut local_oy = 0.0;
 
@@ -967,7 +1333,9 @@ fn travel_layer(
                         Some(base) => [base[0] + delta[0], base[1] + delta[1], base[2] + delta[2]],
                         None => delta,
                     });
-                    ctx.transform = ctx.transform.then(EmoteTransform2D::translation(delta[0], delta[1]));
+                    ctx.transform = ctx
+                        .transform
+                        .then(EmoteTransform2D::translation(delta[0], delta[1]));
                 }
             }
         }
@@ -977,7 +1345,8 @@ fn travel_layer(
                 continue;
             };
             let frame_value = PsbValue::Object(frame_obj.to_vec());
-            let Some(content_fields) = frame_value.field("content").and_then(PsbValue::as_object) else {
+            let Some(content_fields) = frame_value.field("content").and_then(PsbValue::as_object)
+            else {
                 continue;
             };
             let content = PsbValue::Object(content_fields.to_vec());
@@ -993,14 +1362,25 @@ fn travel_layer(
             if let Some(rest) = src.strip_prefix("motion/") {
                 if ctx.base_location.is_some() {
                     let mut parts = rest.split('/').filter(|s| !s.is_empty());
-                    if let (Some(object_name), Some(child_motion_name)) = (parts.next(), parts.next()) {
+                    if let (Some(object_name), Some(child_motion_name)) =
+                        (parts.next(), parts.next())
+                    {
                         recurse_motion(
                             object_table,
                             object_name,
                             child_motion_name,
                             textures,
-                            ctx_with_visible(ctx.clone(), suggest_visible),
+                            ctx_with_visible(
+                                mask_child_context(
+                                    ctx.clone(),
+                                    current_stencil_phase,
+                                    current_composite_item,
+                                ),
+                                suggest_visible,
+                            ),
                             out,
+                            layer_states,
+                            mask_owners,
                         )?;
                     }
                 }
@@ -1025,7 +1405,7 @@ fn travel_layer(
                             0.0,
                             visible,
                             opa_raw,
-                            draw_ctx_with_index(ctx.clone(), out.len()),
+                            ctx.clone(),
                         ) {
                             out.push(sprite);
                         }
@@ -1036,35 +1416,61 @@ fn travel_layer(
                         src,
                         icon_name,
                         textures,
-                        ctx_with_visible(ctx.clone(), suggest_visible),
+                        ctx_with_visible(
+                            mask_child_context(
+                                ctx.clone(),
+                                current_stencil_phase,
+                                current_composite_item,
+                            ),
+                            suggest_visible,
+                        ),
                         out,
+                        layer_states,
+                        mask_owners,
                     )?;
                 }
             }
         }
     }
 
+    layer_states.push(layer_state_from_ctx(label, &ctx));
+
     if let Some(children) = layer.field("children").and_then(PsbValue::as_list) {
         for (index, child) in children.iter().enumerate() {
-            let mut child_ctx = ctx.clone();
-            child_ctx.draw_index = out.len() + index;
-            travel_layer(child, object_table, textures, motion_name, child_ctx, out)?;
+            let mut next_ctx =
+                mask_child_context(ctx.clone(), current_stencil_phase, current_composite_item);
+            next_ctx.draw_index = out.len() + index;
+            travel_layer(
+                child,
+                object_table,
+                textures,
+                motion_name,
+                next_ctx,
+                out,
+                layer_states,
+                mask_owners,
+            )?;
         }
     }
     if let Some(children) = layer.field("layer").and_then(PsbValue::as_list) {
         for (index, child) in children.iter().enumerate() {
-            let mut child_ctx = ctx.clone();
-            child_ctx.draw_index = out.len() + index;
-            travel_layer(child, object_table, textures, motion_name, child_ctx, out)?;
+            let mut next_ctx =
+                mask_child_context(ctx.clone(), current_stencil_phase, current_composite_item);
+            next_ctx.draw_index = out.len() + index;
+            travel_layer(
+                child,
+                object_table,
+                textures,
+                motion_name,
+                next_ctx,
+                out,
+                layer_states,
+                mask_owners,
+            )?;
         }
     }
 
     Ok(())
-}
-
-fn draw_ctx_with_index(mut ctx: TravelContext, draw_index: usize) -> TravelContext {
-    ctx.draw_index = draw_index;
-    ctx
 }
 
 fn first_frame_content_with(frame_list: &[PsbValue], key: &str) -> Option<PsbValue> {
@@ -1086,6 +1492,8 @@ fn recurse_motion(
     textures: &BTreeMap<String, EmoteTextureSource>,
     ctx: TravelContext,
     out: &mut Vec<EmoteStaticSprite>,
+    layer_states: &mut Vec<EmoteStepFrameLayerState>,
+    mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
     let Some(layers) = object_table
         .field(object_name)
@@ -1096,11 +1504,30 @@ fn recurse_motion(
     else {
         return Ok(());
     };
+    let motion = object_table
+        .field(object_name)
+        .and_then(|object| object.field("motion"))
+        .and_then(|motion| motion.field(motion_name));
+    let priority_ranks = motion
+        .map(|m| motion_priority_ranks(m, 0.0))
+        .unwrap_or_default();
+    let draw_order_base = ctx.draw_index.saturating_mul(1000);
 
     for (index, layer) in layers.iter().enumerate() {
         let mut next_ctx = ctx.clone();
-        next_ctx.draw_index = out.len() + index;
-        travel_layer(layer, object_table, textures, motion_name, next_ctx, out)?;
+        next_ctx.draw_order_base = draw_order_base;
+        next_ctx.priority_ranks = priority_ranks.clone();
+        next_ctx.draw_index = draw_order_base.saturating_add(index);
+        travel_layer(
+            layer,
+            object_table,
+            textures,
+            motion_name,
+            next_ctx,
+            out,
+            layer_states,
+            mask_owners,
+        )?;
     }
     Ok(())
 }
@@ -1110,23 +1537,62 @@ fn ctx_with_visible(mut ctx: TravelContext, visible: bool) -> TravelContext {
     ctx
 }
 
+fn mask_child_context(
+    mut ctx: TravelContext,
+    _stencil_phase: i64,
+    _composite_item: bool,
+) -> TravelContext {
+    // Descendants of a composite-mask owner (stencilType & 4 layer with a
+    // non-empty stencilCompositeMaskLayerList) carry that owner's path so the
+    // renderer can resolve a per-reference alpha mask texture for them.  The
+    // condition mirrors `sub_103390C0` second-pass owner check at
+    // `(layerInfo+720) & 4`.  Stencil-phase masks (bits 0..1 of +720) are a
+    // separate flow that we do not implement with alpha textures, so they do
+    // not influence parent_mask_path here.
+    let is_composite_mask_owner =
+        (ctx.stencil_type & 0x4) != 0 && !ctx.stencil_composite_mask_layer_list.is_empty();
+    if is_composite_mask_owner {
+        ctx.parent_mask_path = Some(ctx.path.clone());
+    }
+    ctx
+}
+
+fn is_drawframe_mask_context(ctx: &TravelContext) -> bool {
+    // sub_103390C0 treats layer type 3 as the mask/composite-mask draw item path.
+    // A non-mask renderable layer can still carry stencilType bits at drawFrameInfo+104;
+    // those bits must not make the layer disappear into a mask-only pass.
+    ctx.layer_type == 3
+        && ((ctx.stencil_type & 0x3) != 0
+            || (ctx.stencil_type & 0x4) != 0
+            || !ctx.stencil_composite_mask_layer_list.is_empty())
+}
+
 fn ctx_with_opacity(mut ctx: TravelContext, opa_raw: f32) -> TravelContext {
     ctx.opacity_multiplier = (ctx.opacity_multiplier * (opa_raw / 10.0)).clamp(0.0, 1.0);
     ctx
 }
 
-fn apply_layer_transform(mut ctx: TravelContext, coord: Option<[f32; 3]>, scale_x: f32, scale_y: f32, rotation_degrees: f32) -> TravelContext {
+fn apply_layer_transform(
+    mut ctx: TravelContext,
+    coord: Option<[f32; 3]>,
+    scale_x: f32,
+    scale_y: f32,
+    rotation_degrees: f32,
+) -> TravelContext {
     let delta = coord.unwrap_or([0.0, 0.0, 0.0]);
     ctx.base_location = Some(match ctx.base_location {
         Some(base) => [base[0] + delta[0], base[1] + delta[1], base[2] + delta[2]],
         None => delta,
     });
-    let local = EmoteTransform2D::translation(delta[0], delta[1])
-        .then(EmoteTransform2D::scale_rotation(scale_x, scale_y, rotation_degrees));
+    let translate = EmoteTransform2D::translation(delta[0], delta[1]);
+    let scale_rotate = EmoteTransform2D::scale_rotation(scale_x, scale_y, rotation_degrees);
+    let local = match ctx.transform_order.as_slice() {
+        [0, 3, 2, 1] => scale_rotate.then(translate),
+        _ => translate.then(scale_rotate),
+    };
     ctx.transform = ctx.transform.then(local);
     ctx
 }
-
 
 fn build_sprite(
     textures: &BTreeMap<String, EmoteTextureSource>,
@@ -1194,7 +1660,9 @@ fn build_sprite(
 }
 
 fn compute_bounds(sprites: &[EmoteStaticSprite]) -> Option<EmoteSceneBounds> {
-    let mut iter = sprites.iter().filter(|sprite| sprite.visible && sprite.opacity > 0.0);
+    let mut iter = sprites
+        .iter()
+        .filter(|sprite| sprite.visible && sprite.opacity > 0.0);
     let first = iter.next()?;
     let (left, top, right, bottom) = first.bounds_rect();
     let mut bounds = EmoteSceneBounds {
@@ -1209,7 +1677,6 @@ fn compute_bounds(sprites: &[EmoteStaticSprite]) -> Option<EmoteSceneBounds> {
     }
     Some(bounds)
 }
-
 
 #[derive(Debug, Clone)]
 struct DynamicFrameState {
@@ -1275,6 +1742,52 @@ fn motion_duration_ticks(motion: &PsbValue) -> Option<f32> {
     (max_time > 0.0).then_some(max_time)
 }
 
+fn motion_priority_ranks(motion: &PsbValue, time_ticks: f32) -> BTreeMap<String, usize> {
+    let Some(layer_index_map) = motion.field("layerIndexMap").and_then(PsbValue::as_object) else {
+        return BTreeMap::new();
+    };
+    let Some(priority_content) = evaluate_priority_content(
+        motion.field("priority").and_then(PsbValue::as_list),
+        time_ticks,
+    ) else {
+        return BTreeMap::new();
+    };
+
+    let mut rank_by_index = BTreeMap::<i64, usize>::new();
+    for (rank, value) in priority_content.iter().enumerate() {
+        if let Some(index) = value.as_i64() {
+            rank_by_index.insert(index, rank);
+        }
+    }
+
+    let mut ranks = BTreeMap::new();
+    for (label, index_value) in layer_index_map {
+        if let Some(index) = index_value.as_i64() {
+            if let Some(rank) = rank_by_index.get(&index).copied() {
+                ranks.insert(label.clone(), rank);
+            }
+        }
+    }
+    ranks
+}
+
+fn evaluate_priority_content(
+    priority: Option<&[PsbValue]>,
+    time_ticks: f32,
+) -> Option<&[PsbValue]> {
+    let mut current = None;
+    for frame in priority? {
+        let frame_time = frame.field_f32("time").unwrap_or(0.0);
+        if frame_time > time_ticks {
+            break;
+        }
+        if frame.field_i64("type").unwrap_or(1) == 1 {
+            current = frame.field("content").and_then(PsbValue::as_list);
+        }
+    }
+    current
+}
+
 fn max_layer_frame_time(layer: &PsbValue) -> f32 {
     let mut max_time: f32 = 0.0;
     if let Some(frame_list) = layer.field("frameList").and_then(PsbValue::as_list) {
@@ -1314,8 +1827,12 @@ fn evaluate_frame_list(frame_list: &[PsbValue], time_ticks: f32) -> DynamicFrame
         }
 
         if frame.field_i64("type").unwrap_or(3) == 0 && frame.field("content").is_none() {
+            // Empty type-0 frames reset the current frame slot's emitted
+            // content.  They are not a subtree visibility command: the
+            // recovered drawFrameInfo path gates sprite emission through the
+            // frame-slot valid flag, while child layer visibility still comes
+            // from their own frame slots and controller state.
             state = DynamicFrameState::default();
-            state.opa = 0.0;
             previous_content = None;
             previous_time = frame_time;
             state.frame_index = Some(index);
@@ -1341,8 +1858,39 @@ fn evaluate_frame_list(frame_list: &[PsbValue], time_ticks: f32) -> DynamicFrame
             interpolate_frame_content(&mut state, prev, next, t);
         }
     }
+    if let Some(rotation) = evaluate_rotation_keyframes(frame_list, time_ticks) {
+        state.rotation_degrees = rotation;
+    }
 
     state
+}
+
+fn evaluate_rotation_keyframes(frame_list: &[PsbValue], time_ticks: f32) -> Option<f32> {
+    let mut prev: Option<(f32, f32)> = None;
+    let mut next: Option<(f32, f32, f32)> = None;
+    for frame in frame_list {
+        let frame_time = frame.field_f32("time").unwrap_or(0.0);
+        let Some(content) = frame.field("content") else {
+            continue;
+        };
+        let Some(angle) = content_rotation(content) else {
+            continue;
+        };
+        if frame_time <= time_ticks {
+            prev = Some((frame_time, angle));
+        } else {
+            next = Some((frame_time, angle, frame.field_f32("easing").unwrap_or(0.0)));
+            break;
+        }
+    }
+    match (prev, next) {
+        (Some((t0, a0)), Some((t1, a1, easing))) if t1 > t0 => {
+            let t = frame_easing(((time_ticks - t0) / (t1 - t0)).clamp(0.0, 1.0), easing);
+            Some(lerp(a0, a1, t))
+        }
+        (Some((_t, angle)), _) => Some(angle),
+        _ => None,
+    }
 }
 
 fn frame_easing(t: f32, easing: f32) -> f32 {
@@ -1355,7 +1903,12 @@ fn frame_easing(t: f32, easing: f32) -> f32 {
     }
 }
 
-fn interpolate_frame_content(state: &mut DynamicFrameState, prev: &PsbValue, next: &PsbValue, t: f32) {
+fn interpolate_frame_content(
+    state: &mut DynamicFrameState,
+    prev: &PsbValue,
+    next: &PsbValue,
+    t: f32,
+) {
     if let (Some(a), Some(b)) = (content_coord(prev), content_coord(next)) {
         state.coord = Some([
             lerp(a[0], b[0], t),
@@ -1381,7 +1934,16 @@ fn interpolate_frame_content(state: &mut DynamicFrameState, prev: &PsbValue, nex
     if let (Some(a), Some(b)) = (content_rotation(prev), content_rotation(next)) {
         state.rotation_degrees = lerp(a, b, t);
     }
-    if let (Some(a), Some(b)) = (parse_content_mesh_patch(prev, 1, 1), parse_content_mesh_patch(next, 1, 1)) {
+    if let (Some(mut a), Some(mut b)) = (
+        parse_content_mesh_patch(prev, 1, 1),
+        parse_content_mesh_patch(next, 1, 1),
+    ) {
+        if a.domain.is_none() {
+            a.domain = prev.field_str("icon").and_then(parse_mesh_domain_icon);
+        }
+        if b.domain.is_none() {
+            b.domain = next.field_str("icon").and_then(parse_mesh_domain_icon);
+        }
         state.mesh_patch = Some(EmoteMeshPatch::interpolate(&a, &b, t));
     }
 }
@@ -1403,21 +1965,24 @@ fn content_coord(content: &PsbValue) -> Option<[f32; 3]> {
 }
 
 fn content_scale_x(content: &PsbValue) -> Option<f32> {
-    content.field_f32("scale_x")
+    content
+        .field_f32("scale_x")
         .or_else(|| content.field_f32("scaleX"))
         .or_else(|| content.field_f32("scale"))
         .or_else(|| content.field_f32("zoom"))
 }
 
 fn content_scale_y(content: &PsbValue) -> Option<f32> {
-    content.field_f32("scale_y")
+    content
+        .field_f32("scale_y")
         .or_else(|| content.field_f32("scaleY"))
         .or_else(|| content.field_f32("scale"))
         .or_else(|| content.field_f32("zoom"))
 }
 
 fn content_rotation(content: &PsbValue) -> Option<f32> {
-    content.field_f32("angle")
+    content
+        .field_f32("angle")
         .or_else(|| content.field_f32("rot"))
         .or_else(|| content.field_f32("rotation"))
 }
@@ -1463,11 +2028,25 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
     {
         state.time_offset_ticks = time_offset;
     }
-    if let Some(mesh) = parse_content_mesh_patch(content, 1, 1) {
+    if let Some(mut mesh) = parse_content_mesh_patch(content, 1, 1) {
+        if mesh.domain.is_none() {
+            mesh.domain = content.field_str("icon").and_then(parse_mesh_domain_icon);
+        }
         state.mesh_patch = Some(mesh);
     }
 }
 
+fn parse_mesh_domain_icon(icon: &str) -> Option<[f32; 4]> {
+    let mut parts = icon.split(':');
+    let x = parts.next()?.parse::<f32>().ok()?;
+    let y = parts.next()?.parse::<f32>().ok()?;
+    let half_w = parts.next()?.parse::<f32>().ok()?;
+    let half_h = parts.next()?.parse::<f32>().ok()?;
+    if parts.next().is_some() || half_w <= 0.0 || half_h <= 0.0 {
+        return None;
+    }
+    Some([x - half_w, y - half_h, half_w * 2.0, half_h * 2.0])
+}
 
 #[derive(Debug, Clone)]
 struct LayerParameterEval {
@@ -1485,7 +2064,11 @@ fn layer_parameter_eval(
 ) -> Option<LayerParameterEval> {
     if let Some(parameterize) = layer.field("parameterize") {
         let Some(parameter) = resolve_parameterize(parameterize, parameter_table) else {
-            return Some(LayerParameterEval { id: None, value: None, local_time_ticks: 0.0 });
+            return Some(LayerParameterEval {
+                id: None,
+                value: None,
+                local_time_ticks: 0.0,
+            });
         };
         let Some(id) = parameter
             .field_str("id")
@@ -1493,7 +2076,11 @@ fn layer_parameter_eval(
             .or_else(|| parameter.field_str("name"))
             .filter(|s| !s.is_empty())
         else {
-            return Some(LayerParameterEval { id: None, value: None, local_time_ticks: 0.0 });
+            return Some(LayerParameterEval {
+                id: None,
+                value: None,
+                local_time_ticks: 0.0,
+            });
         };
 
         let Some(value) = variables.get(id).copied() else {
@@ -1506,7 +2093,11 @@ fn layer_parameter_eval(
                     }
                 }
             }
-            return Some(LayerParameterEval { id: Some(id.to_owned()), value: None, local_time_ticks: 0.0 });
+            return Some(LayerParameterEval {
+                id: Some(id.to_owned()),
+                value: None,
+                local_time_ticks: 0.0,
+            });
         };
 
         let begin = parameter
@@ -1518,8 +2109,17 @@ fn layer_parameter_eval(
             .or_else(|| parameter.field_f32("max"))
             .unwrap_or(1.0);
         let max_time = max_frame_list_time(frame_list);
-        if !max_time.is_finite() || max_time <= 0.0 || !begin.is_finite() || !end.is_finite() || (end - begin).abs() <= f32::EPSILON {
-            return Some(LayerParameterEval { id: Some(id.to_owned()), value: Some(value), local_time_ticks: 0.0 });
+        if !max_time.is_finite()
+            || max_time <= 0.0
+            || !begin.is_finite()
+            || !end.is_finite()
+            || (end - begin).abs() <= f32::EPSILON
+        {
+            return Some(LayerParameterEval {
+                id: Some(id.to_owned()),
+                value: Some(value),
+                local_time_ticks: 0.0,
+            });
         }
         let t = ((value - begin) / (end - begin)).clamp(0.0, 1.0);
         return Some(LayerParameterEval {
@@ -1529,33 +2129,40 @@ fn layer_parameter_eval(
         });
     }
 
-    let max_time = max_frame_list_time(frame_list);
-    if !max_time.is_finite() || max_time <= 0.0 {
-        return Some(LayerParameterEval { id: None, value: None, local_time_ticks: 0.0 });
-    }
-
-    let local_duration = layer
-        .field_f32("loopTime")
-        .or_else(|| layer.field_f32("lastTime"))
-        .unwrap_or(max_time)
-        .max(max_time);
-    if local_duration.is_finite() && local_duration > 0.0 {
-        Some(LayerParameterEval {
-            id: None,
-            value: None,
-            local_time_ticks: fallback_time_ticks.rem_euclid(local_duration.max(1.0)),
-        })
-    } else {
-        Some(LayerParameterEval { id: None, value: None, local_time_ticks: fallback_time_ticks })
-    }
+    let _ = fallback_time_ticks;
+    // REVERSE_FACTS.md confirms LayerInfo+12 is the per-layer parameterize id.
+    // Driving an unparameterized layer's frameList from the global timeline
+    // advances structural sprites into empty/type-0 reset frames, which makes
+    // body/clothes/legs disappear.  Keep such layers on their authored base
+    // frame until their original non-parameterized frame-slot update path is
+    // recovered from StepFrame.
+    Some(LayerParameterEval {
+        id: None,
+        value: None,
+        local_time_ticks: 0.0,
+    })
 }
 
-fn resolve_parameterize<'a>(parameterize: &'a PsbValue, parameter_table: Option<&'a [PsbValue]>) -> Option<&'a PsbValue> {
+fn resolve_parameterize<'a>(
+    parameterize: &'a PsbValue,
+    parameter_table: Option<&'a [PsbValue]>,
+) -> Option<&'a PsbValue> {
     match parameterize {
         PsbValue::Object(_) => Some(parameterize),
         PsbValue::Int(index) if *index >= 0 => parameter_table?.get(*index as usize),
         _ => None,
     }
+}
+
+fn layer_parameter_id(layer: &PsbValue, parameter_table: Option<&[PsbValue]>) -> Option<String> {
+    let parameterize = layer.field("parameterize")?;
+    let parameter = resolve_parameterize(parameterize, parameter_table)?;
+    parameter
+        .field_str("id")
+        .or_else(|| parameter.field_str("key"))
+        .or_else(|| parameter.field_str("name"))
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 fn max_frame_list_time(frame_list: &[PsbValue]) -> f32 {
@@ -1595,6 +2202,7 @@ fn evaluate_mesh_combinator_split(
     if combinators.is_empty() {
         return None;
     }
+    let layer_domain = layer_mesh_domain(layer);
 
     let first_key = combinators
         .first()
@@ -1603,7 +2211,11 @@ fn evaluate_mesh_combinator_split(
     let parent_key = layer
         .field("parameterize")
         .and_then(|p| resolve_parameterize(p, parameter_table))
-        .and_then(|p| p.field_str("id").or_else(|| p.field_str("key")).or_else(|| p.field_str("name")));
+        .and_then(|p| {
+            p.field_str("id")
+                .or_else(|| p.field_str("key"))
+                .or_else(|| p.field_str("name"))
+        });
     let restore_first_to_parent = match (parent_key, first_key) {
         (None, _) => true,
         (Some("param"), _) => true,
@@ -1617,25 +2229,48 @@ fn evaluate_mesh_combinator_split(
     let mut start_index = 0usize;
     if restore_first_to_parent {
         if let Some(first) = combinators.first() {
-            if let Some(patch) = evaluate_one_combinator(first, psb, data, variables, division_x, division_y, false) {
-                self_patch = Some(patch);
-                child_patch = combine_patch(child_patch, patch);
+            if let Some(patch) =
+                evaluate_one_combinator(first, psb, data, variables, division_x, division_y, false)
+            {
+                self_patch = Some(patch_with_domain(patch, layer_domain));
                 start_index = 1;
             }
         }
     }
 
     for combinator in combinators.iter().skip(start_index) {
-        if let Some(patch) = evaluate_one_combinator(combinator, psb, data, variables, division_x, division_y, true) {
-            child_patch = combine_patch(child_patch, patch);
+        if let Some(patch) = evaluate_one_combinator(
+            combinator, psb, data, variables, division_x, division_y, true,
+        ) {
+            child_patch = combine_patch(child_patch, patch_with_domain(patch, layer_domain));
         }
     }
 
     if self_patch.is_none() && child_patch.is_none() {
         None
     } else {
-        Some(MeshCombinatorEval { self_patch, child_patch })
+        Some(MeshCombinatorEval {
+            self_patch,
+            child_patch,
+        })
     }
+}
+
+fn layer_mesh_domain(layer: &PsbValue) -> Option<[f32; 4]> {
+    layer
+        .field("frameList")
+        .and_then(PsbValue::as_list)?
+        .iter()
+        .filter_map(|frame| frame.field("content"))
+        .filter_map(|content| content.field_str("icon"))
+        .find_map(parse_mesh_domain_icon)
+}
+
+fn patch_with_domain(mut patch: EmoteMeshPatch, domain: Option<[f32; 4]>) -> EmoteMeshPatch {
+    if patch.domain.is_none() {
+        patch.domain = domain;
+    }
+    patch
 }
 
 fn travel_layer_at(
@@ -1650,6 +2285,8 @@ fn travel_layer_at(
     time_ticks: f32,
     mut ctx: TravelContext,
     out: &mut Vec<EmoteStaticSprite>,
+    layer_states: &mut Vec<EmoteStepFrameLayerState>,
+    mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
     let Some(fields) = value.as_object() else {
         return Ok(());
@@ -1657,7 +2294,15 @@ fn travel_layer_at(
     let layer = PsbValue::Object(fields.to_vec());
 
     ctx = enter_layer_context(ctx, &layer, out.len());
-
+    // sub_103390C0 second pass: a layer owns a composite-mask reference when
+    // (layerInfo+720) & 4 is set AND the layer carries a non-empty source
+    // list at (layerInfo+740)+8.  Record the owner path so descendants whose
+    // `parent_mask_path` points here can resolve the mask reference.
+    if (ctx.stencil_type & 0x4) != 0 && !ctx.stencil_composite_mask_layer_list.is_empty() {
+        mask_owners
+            .entry(ctx.path.clone())
+            .or_insert_with(|| ctx.stencil_composite_mask_layer_list.clone());
+    }
     let mesh_combinator = evaluate_mesh_combinator_split(
         &layer,
         parameter_table,
@@ -1669,21 +2314,51 @@ fn travel_layer_at(
     );
     let mut draw_ctx = ctx.clone();
     let mut child_ctx = ctx.clone();
+    let sync_child_shape = (ctx.mesh_sync_child & 0x8) != 0;
+    let layer_mesh_parameter = if sync_child_shape {
+        layer_parameter_id(&layer, parameter_table)
+    } else {
+        None
+    };
+    // Descendants point back at a composite-mask owner (stencilType & 4 layer
+    // with a non-empty stencilCompositeMaskLayerList).  Renderer side keys
+    // alpha-mask textures by this same owner path; the linkage matches
+    // sub_103390C0 second pass owner check at `(layerInfo+720) & 4`.
+    let is_composite_mask_owner =
+        (ctx.stencil_type & 0x4) != 0 && !ctx.stencil_composite_mask_layer_list.is_empty();
+    if is_composite_mask_owner {
+        child_ctx.parent_mask_path = Some(ctx.path.clone());
+    }
     if let Some(mesh_combinator) = mesh_combinator {
         if let Some(patch) = mesh_combinator.self_patch {
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), patch);
-            child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
+            if sync_child_shape {
+                child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
+                if let Some(id) = &layer_mesh_parameter {
+                    child_ctx.mesh_parameters.insert(id.clone());
+                }
+            }
         }
-        if let Some(patch) = mesh_combinator.child_patch {
-            child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
+        if sync_child_shape {
+            if let Some(patch) = mesh_combinator.child_patch {
+                child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
+                if let Some(id) = &layer_mesh_parameter {
+                    child_ctx.mesh_parameters.insert(id.clone());
+                }
+            }
         }
     }
 
     let label = layer.field_str("label").map(str::to_owned);
     let mut active_external_motion = false;
     if let Some(frame_list) = layer.field("frameList").and_then(PsbValue::as_list) {
-        let param_eval = layer_parameter_eval(&layer, parameter_table, variables, frame_list, time_ticks)
-            .unwrap_or(LayerParameterEval { id: None, value: None, local_time_ticks: 0.0 });
+        let param_eval =
+            layer_parameter_eval(&layer, parameter_table, variables, frame_list, time_ticks)
+                .unwrap_or(LayerParameterEval {
+                    id: None,
+                    value: None,
+                    local_time_ticks: 0.0,
+                });
         draw_ctx.control_parameter = param_eval.id.clone();
         draw_ctx.control_value = param_eval.value;
         draw_ctx.local_time_ticks = Some(param_eval.local_time_ticks);
@@ -1702,13 +2377,31 @@ fn travel_layer_at(
             let mesh = EmoteMeshPatch {
                 division_x: ctx.mesh_division_x.max(mesh.division_x),
                 division_y: ctx.mesh_division_y.max(mesh.division_y),
+                domain: mesh.domain,
                 control_points: mesh.control_points,
             };
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), mesh);
-            child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), mesh);
+            if sync_child_shape {
+                child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), mesh);
+                if let Some(id) = &layer_mesh_parameter {
+                    child_ctx.mesh_parameters.insert(id.clone());
+                }
+            }
         }
-        draw_ctx = apply_layer_transform(draw_ctx, state.coord, state.scale_x, state.scale_y, state.rotation_degrees);
-        child_ctx = apply_layer_transform(child_ctx, state.coord, state.scale_x, state.scale_y, state.rotation_degrees);
+        draw_ctx = apply_layer_transform(
+            draw_ctx,
+            state.coord,
+            state.scale_x,
+            state.scale_y,
+            state.rotation_degrees,
+        );
+        child_ctx = apply_layer_transform(
+            child_ctx,
+            state.coord,
+            state.scale_x,
+            state.scale_y,
+            state.rotation_degrees,
+        );
         draw_ctx = ctx_with_opacity(draw_ctx, state.opa);
         child_ctx = ctx_with_opacity(child_ctx, state.opa);
 
@@ -1718,7 +2411,17 @@ fn travel_layer_at(
             if let Some(rest) = src.strip_prefix("motion/") {
                 if visible_child_ctx.base_location.is_some() {
                     let mut parts = rest.split('/').filter(|s| !s.is_empty());
-                    if let (Some(object_name), Some(child_motion_name)) = (parts.next(), parts.next()) {
+                    if let (Some(object_name), Some(child_motion_name)) =
+                        (parts.next(), parts.next())
+                    {
+                        let mut motion_ctx = visible_child_ctx;
+                        apply_motion_layer_inherit(
+                            &layer,
+                            object_table,
+                            object_name,
+                            child_motion_name,
+                            &mut motion_ctx,
+                        );
                         recurse_motion_at(
                             object_table,
                             object_name,
@@ -1729,8 +2432,10 @@ fn travel_layer_at(
                             variables,
                             textures,
                             time_ticks + state.time_offset_ticks,
-                            visible_child_ctx,
+                            motion_ctx,
                             out,
+                            layer_states,
+                            mask_owners,
                         )?;
                         active_external_motion = true;
                     }
@@ -1752,12 +2457,14 @@ fn travel_layer_at(
                             0.0,
                             visible,
                             10.0,
-                            draw_ctx_with_index(draw_ctx, out.len()),
+                            draw_ctx,
                         ) {
                             out.push(sprite);
                         }
                     }
                 } else if object_table.field(src).is_some() {
+                    let mut motion_ctx = visible_child_ctx;
+                    apply_motion_layer_inherit(&layer, object_table, src, icon_name, &mut motion_ctx);
                     recurse_motion_at(
                         object_table,
                         src,
@@ -1768,14 +2475,18 @@ fn travel_layer_at(
                         variables,
                         textures,
                         time_ticks + state.time_offset_ticks,
-                        visible_child_ctx,
+                        motion_ctx,
                         out,
+                        layer_states,
+                        mask_owners,
                     )?;
                     active_external_motion = true;
                 }
             }
         }
     }
+
+    layer_states.push(layer_state_from_ctx(label, &child_ctx));
 
     if active_external_motion {
         return Ok(());
@@ -1785,18 +2496,97 @@ fn travel_layer_at(
         for (index, child) in children.iter().enumerate() {
             let mut next_ctx = child_ctx.clone();
             next_ctx.draw_index = out.len() + index;
-            travel_layer_at(child, object_table, parameter_table, psb, psb_data, variables, textures, motion_name, time_ticks, next_ctx, out)?;
+            travel_layer_at(
+                child,
+                object_table,
+                parameter_table,
+                psb,
+                psb_data,
+                variables,
+                textures,
+                motion_name,
+                time_ticks,
+                next_ctx,
+                out,
+                layer_states,
+                mask_owners,
+            )?;
         }
     }
     if let Some(children) = layer.field("layer").and_then(PsbValue::as_list) {
         for (index, child) in children.iter().enumerate() {
             let mut next_ctx = child_ctx.clone();
             next_ctx.draw_index = out.len() + index;
-            travel_layer_at(child, object_table, parameter_table, psb, psb_data, variables, textures, motion_name, time_ticks, next_ctx, out)?;
+            travel_layer_at(
+                child,
+                object_table,
+                parameter_table,
+                psb,
+                psb_data,
+                variables,
+                textures,
+                motion_name,
+                time_ticks,
+                next_ctx,
+                out,
+                layer_states,
+                mask_owners,
+            )?;
         }
     }
 
     Ok(())
+}
+
+fn apply_motion_layer_inherit(
+    layer: &PsbValue,
+    object_table: &PsbValue,
+    object_name: &str,
+    motion_name: &str,
+    ctx: &mut TravelContext,
+) {
+    if layer.field_i64("motionIndependentLayerInherit").unwrap_or(1) != 0 {
+        return;
+    }
+    let Some(target_parameters) = target_motion_parameter_ids(object_table, object_name, motion_name)
+    else {
+        ctx.mesh_patch = None;
+        ctx.mesh_parameters.clear();
+        return;
+    };
+    let shared_parameter_count = target_parameters
+        .iter()
+        .filter(|parameter| ctx.mesh_parameters.contains(*parameter))
+        .count();
+    if shared_parameter_count < 4 {
+        ctx.mesh_patch = None;
+        ctx.mesh_parameters.clear();
+    }
+}
+
+fn target_motion_parameter_ids(
+    object_table: &PsbValue,
+    object_name: &str,
+    motion_name: &str,
+) -> Option<BTreeSet<String>> {
+    let parameters = object_table
+        .field(object_name)?
+        .field("motion")?
+        .field(motion_name)?
+        .field("parameter")?
+        .as_list()?;
+    let ids = parameters
+        .iter()
+        .filter_map(|parameter| {
+            parameter
+                .field_str("id")
+                .or_else(|| parameter.field_str("key"))
+                .or_else(|| parameter.field_str("name"))
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Some(ids)
 }
 
 fn recurse_motion_at(
@@ -1811,6 +2601,8 @@ fn recurse_motion_at(
     time_ticks: f32,
     ctx: TravelContext,
     out: &mut Vec<EmoteStaticSprite>,
+    layer_states: &mut Vec<EmoteStepFrameLayerState>,
+    mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
     let Some(motion) = object_table
         .field(object_name)
@@ -1822,13 +2614,34 @@ fn recurse_motion_at(
     let Some(layers) = motion.field("layer").and_then(PsbValue::as_list) else {
         return Ok(());
     };
-    let motion_parameter_table = motion.field("parameter").and_then(PsbValue::as_list).or(parameter_table);
+    let motion_parameter_table = motion
+        .field("parameter")
+        .and_then(PsbValue::as_list)
+        .or(parameter_table);
     let duration = motion_duration_ticks(motion).unwrap_or(0.0);
     let effective_time = wrap_motion_time(time_ticks, duration);
+    let priority_ranks = motion_priority_ranks(motion, effective_time);
+    let draw_order_base = ctx.draw_index.saturating_mul(1000);
     for (index, layer) in layers.iter().enumerate() {
         let mut next_ctx = ctx.clone();
-        next_ctx.draw_index = out.len() + index;
-        travel_layer_at(layer, object_table, motion_parameter_table, psb, psb_data, variables, textures, motion_name, effective_time, next_ctx, out)?;
+        next_ctx.draw_order_base = draw_order_base;
+        next_ctx.priority_ranks = priority_ranks.clone();
+        next_ctx.draw_index = draw_order_base.saturating_add(index);
+        travel_layer_at(
+            layer,
+            object_table,
+            motion_parameter_table,
+            psb,
+            psb_data,
+            variables,
+            textures,
+            motion_name,
+            effective_time,
+            next_ctx,
+            out,
+            layer_states,
+            mask_owners,
+        )?;
     }
     Ok(())
 }
@@ -1846,14 +2659,26 @@ fn parse_mesh_division(value: Option<&PsbValue>) -> Option<(u32, u32)> {
             return Some((x, y));
         }
     }
-    if let Some(x) = value.field_i64("x").or_else(|| value.field_i64("width")).or_else(|| value.field_i64("divisionX")) {
-        let y = value.field_i64("y").or_else(|| value.field_i64("height")).or_else(|| value.field_i64("divisionY")).unwrap_or(x);
+    if let Some(x) = value
+        .field_i64("x")
+        .or_else(|| value.field_i64("width"))
+        .or_else(|| value.field_i64("divisionX"))
+    {
+        let y = value
+            .field_i64("y")
+            .or_else(|| value.field_i64("height"))
+            .or_else(|| value.field_i64("divisionY"))
+            .unwrap_or(x);
         return Some((x.clamp(1, 256) as u32, y.clamp(1, 256) as u32));
     }
     None
 }
 
-fn parse_content_mesh_patch(content: &PsbValue, division_x: u32, division_y: u32) -> Option<EmoteMeshPatch> {
+fn parse_content_mesh_patch(
+    content: &PsbValue,
+    division_x: u32,
+    division_y: u32,
+) -> Option<EmoteMeshPatch> {
     if let Some(mesh) = content.field("mesh") {
         if let Some(patch) = parse_mesh_dict_patch(mesh, division_x, division_y) {
             return Some(patch);
@@ -1865,7 +2690,11 @@ fn parse_content_mesh_patch(content: &PsbValue, division_x: u32, division_y: u32
     None
 }
 
-fn parse_mesh_dict_patch(mesh: &PsbValue, division_x: u32, division_y: u32) -> Option<EmoteMeshPatch> {
+fn parse_mesh_dict_patch(
+    mesh: &PsbValue,
+    division_x: u32,
+    division_y: u32,
+) -> Option<EmoteMeshPatch> {
     parse_bezier_patch(mesh.field("bp")?, division_x, division_y)
 }
 
@@ -1877,7 +2706,9 @@ fn parse_bezier_patch(bp: &PsbValue, division_x: u32, division_y: u32) -> Option
             for i in 0..16 {
                 patch.control_points[i] = [
                     values[i * 2].as_f32().unwrap_or(patch.control_points[i][0]),
-                    values[i * 2 + 1].as_f32().unwrap_or(patch.control_points[i][1]),
+                    values[i * 2 + 1]
+                        .as_f32()
+                        .unwrap_or(patch.control_points[i][1]),
                 ];
             }
             Some(patch)
@@ -1901,7 +2732,11 @@ fn evaluate_one_combinator(
     let begin = variable.field_f32("rangeBegin").unwrap_or(0.0);
     let end = variable.field_f32("rangeEnd").unwrap_or(1.0);
     let value = variables.get(key).copied().unwrap_or_else(|| {
-        if begin <= 0.0 && end >= 0.0 { 0.0 } else { (begin + end) * 0.5 }
+        if begin <= 0.0 && end >= 0.0 {
+            0.0
+        } else {
+            (begin + end) * 0.5
+        }
     });
     let neutral_index = combinator.field_i64("neutralIndex").unwrap_or(-1);
     let resource_index = combinator.field("rawMeshList")?.as_u32()? as usize;
@@ -1911,7 +2746,11 @@ fn evaluate_one_combinator(
         return None;
     }
 
-    let pos = if mesh_count <= 1 || !begin.is_finite() || !end.is_finite() || (end - begin).abs() <= f32::EPSILON {
+    let pos = if mesh_count <= 1
+        || !begin.is_finite()
+        || !end.is_finite()
+        || (end - begin).abs() <= f32::EPSILON
+    {
         0.0
     } else {
         ((value - begin) / (end - begin)).clamp(0.0, 1.0) * (mesh_count as f32 - 1.0)
@@ -1919,12 +2758,27 @@ fn evaluate_one_combinator(
     let i0 = pos.floor() as usize;
     let i1 = pos.ceil() as usize;
     let t = pos - i0 as f32;
-    let p0 = mesh_patch_from_values(meshes.get(i0)?, neutral_index == i0 as i64, division_x, division_y);
-    let p1 = mesh_patch_from_values(meshes.get(i1).unwrap_or(&meshes[i0]), neutral_index == i1 as i64, division_x, division_y);
+    let p0 = mesh_patch_from_values(
+        meshes.get(i0)?,
+        neutral_index == i0 as i64,
+        division_x,
+        division_y,
+    );
+    let p1 = mesh_patch_from_values(
+        meshes.get(i1).unwrap_or(&meshes[i0]),
+        neutral_index == i1 as i64,
+        division_x,
+        division_y,
+    );
     Some(EmoteMeshPatch::interpolate(&p0, &p1, t))
 }
 
-fn mesh_patch_from_values(values: &[f32; 32], neutral: bool, division_x: u32, division_y: u32) -> EmoteMeshPatch {
+fn mesh_patch_from_values(
+    values: &[f32; 32],
+    neutral: bool,
+    division_x: u32,
+    division_y: u32,
+) -> EmoteMeshPatch {
     if neutral {
         return EmoteMeshPatch::identity(division_x, division_y);
     }

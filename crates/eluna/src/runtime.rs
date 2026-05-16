@@ -6,18 +6,23 @@
 //! variable tracks from `metadata/timelineControl` are evaluated every frame and
 //! feed the same variable map used by the renderer-side mesh deformation path.
 
-use crate::api::{EmotePlayerControl, TimelinePlayMode, VariableWrite};
-use crate::{load_emote_static_scene, EmoteSceneBounds, EmoteSchemaError, EmoteStaticScene, PsbFile, PsbValue};
+use crate::api::{transform_order_mask, EmotePlayerControl, TimelinePlayMode, VariableWrite};
+use crate::{
+    load_emote_static_scene, EmoteSceneBounds, EmoteSchemaError, EmoteStaticScene, PsbFile,
+    PsbValue,
+};
 use std::collections::BTreeMap;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(debug_assertions)]
-static LOOP_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
-#[cfg(debug_assertions)]
 static MIRROR_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
-#[cfg(debug_assertions)]
-static OPAQUE_CONTROL_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
+
+const PHYSICS_MAX_SUBSTEP_TICKS: f32 = 1.0;
+const PHYSICS_EPSILON_TICKS: f32 = 0.00000011920929;
+const PEND_BEND_POWER_STEP: f32 = 0.03125;
+const PEND_BEND_TRIGGER_VALUE: f32 = 28.0;
+const TAU: f32 = std::f32::consts::PI * 2.0;
 
 const CONTROL_METADATA_KEYS: &[&str] = &[
     "bustControl",
@@ -39,11 +44,18 @@ fn is_auto_control_timeline_name(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EmoteVariableFrameInfo {
+    pub label: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmoteVariableInfo {
     pub name: String,
     pub default_value: f32,
     pub min_value: Option<f32>,
     pub max_value: Option<f32>,
+    pub frames: Vec<EmoteVariableFrameInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +73,6 @@ pub struct EmoteVariableTarget {
     pub duration_ticks: f32,
     pub easing: f32,
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmoteTimelineFrame {
@@ -82,50 +93,121 @@ pub struct EmoteTimeline {
     pub path: Option<String>,
     pub duration_ticks: f32,
     pub variables: Vec<EmoteTimelineVariable>,
+    pub is_difference: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ActiveTimelineState {
     mode: TimelinePlayMode,
     elapsed_ticks: f32,
+    blend_ratio: f32,
+    blend_target: Option<TimelineBlendTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TimelineBlendTarget {
+    start_value: f32,
+    target_value: f32,
+    elapsed_ticks: f32,
+    duration_ticks: f32,
+    easing: f32,
+    stop_when_done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmoteApiLogEntry {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl EmoteApiLogEntry {
+    fn new(command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            command: command.into(),
+            args,
+        }
+    }
+
+    fn encode(&self) -> String {
+        if self.args.is_empty() {
+            self.command.clone()
+        } else {
+            format!("{}\t{}", self.command, self.args.join("\t"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmoteCharaProfileInfo {
+    pub label: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindState {
+    pub start: f32,
+    pub goal: f32,
+    pub speed: f32,
+    pub pow_min: f32,
+    pub pow_max: f32,
+    pub elapsed_ticks: f32,
 }
 
 /// Runtime state for one EPBustControl spring (one entry per bustControl item).
-/// Fields confirmed from sub_101D4300 decompilation (see docs/emote.sqlite).
+///
+/// The original control keeps a root point, a bob point, a velocity vector,
+/// and a root-to-target offset.  The group updater interpolates the target
+/// baseLayer position over fixed substeps before calling EPBustControl::step.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BustPhysicsState {
-    /// Current bob position in model (screen Y-down) coordinates.
+    /// Current bob position, corresponding to the original object at +52.
     pub bob: [f32; 3],
-    /// Current bob velocity.
+    /// Current bob velocity, corresponding to the original object at +64.
     pub vel: [f32; 3],
-    /// Equilibrium anchor-to-bob Y displacement (negative of param.ofs).
-    /// At rest: (anchor.y - bob.y) == ofs, so var_ud == 0.
+    /// Y rest/bias term used by the var_ud output.
     pub ofs: f32,
-    /// Set on the first tick to record the initial anchor offset.
+    /// Set on the first group update.
     pub first_tick: bool,
-    /// Stored offset from world anchor (used to track anchor movement).
-    pub anchor_offset: [f32; 2],
+    /// Original root offset: root = target_baseLayer + root_offset.
+    pub root_offset: [f32; 3],
+    /// Previous baseLayer target, used for the original interpolated substep loop.
+    pub last_anchor: Option<[f32; 3]>,
 }
 
-/// Runtime state for one EPPendControl two-segment pendulum (per hairControl item).
-/// Fields confirmed from sub_10201AB0 decompilation (see docs/emote.sqlite).
+/// Runtime state for one EPPendControl two-segment pendulum.
+///
+/// The original control owns a root, two rest points, two current bob points,
+/// two velocities, and a bend oscillator.  Hair and parts controls both use
+/// this state type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HairPhysicsState {
-    /// Bob position for each of the 2 segments.
+    /// Current bob position for the two segments, original +112 and +124.
     pub bob: [[f32; 3]; 2],
-    /// Velocity for each segment.
+    /// Current velocity for the two segments, original +136 and +148.
     pub vel: [[f32; 3]; 2],
-    /// Equilibrium ud displacement stored from pre-computation.
+    /// Y rest/bias term used by var_ud.
     pub ofs: f32,
-    /// Set on the first tick to record initial anchor offset.
+    /// Set on the first group update.
     pub first_tick: bool,
-    /// Stored offset from world anchor.
-    pub anchor_offset: [f32; 2],
+    /// Original root offset: root = target_baseLayer + root_offset.
+    pub root_offset: [f32; 3],
+    /// Previous baseLayer target, used for the original interpolated substep loop.
+    pub last_anchor: Option<[f32; 3]>,
+    /// Bend oscillator phase, original field +164.
+    pub bend_phase: f32,
+    /// Bend oscillator power, original field +168.
+    pub bend_power: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElunaPlayer {
     shown: bool,
+    smoothing: bool,
+    mesh_division_ratio: f32,
+    queuing: bool,
+    color_rgba: u32,
+    grayscale: f32,
+    as_original_scale: bool,
     coord: [f32; 2],
     scale: f32,
     rot: f32,
@@ -138,9 +220,22 @@ pub struct ElunaPlayer {
     pending_writes: Vec<VariableWrite>,
     active_timelines: BTreeMap<String, TimelinePlayMode>,
     active_timeline_states: BTreeMap<String, ActiveTimelineState>,
+    timeline_diff_variables: BTreeMap<String, BTreeMap<String, EmoteVariableState>>,
+    timeline_blend_ratios: BTreeMap<String, f32>,
     runtime_pipeline: EmoteRuntimePipeline,
     bust_states: Vec<BustPhysicsState>,
     hair_states: Vec<HairPhysicsState>,
+    outer_forces: BTreeMap<String, [f32; 2]>,
+    outer_rot: f32,
+    transform_order_mask: u32,
+    hair_scale: f32,
+    parts_scale: f32,
+    bust_scale: f32,
+    wind: Option<WindState>,
+    modified: bool,
+    recording_api_log: bool,
+    replaying_api_log: bool,
+    api_log: Vec<EmoteApiLogEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -189,7 +284,14 @@ pub struct LoopControl {
     pub label: Option<String>,
     pub enabled: bool,
     pub var_loop: Option<String>,
-    pub transition_labels: Vec<String>,
+    pub transition_list: Vec<LoopTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopTransition {
+    pub start: f32,
+    pub end: f32,
+    pub duration_ticks: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,6 +311,7 @@ pub struct TransitionControl {
 pub enum PhysicsControl {
     Bust(PhysicsControlDefinition),
     Hair(PhysicsControlDefinition),
+    Parts(PhysicsControlDefinition),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +364,84 @@ impl ElunaPlayer {
         self.shown
     }
 
+    pub fn smoothing(&self) -> bool {
+        self.smoothing
+    }
+    pub fn set_smoothing(&mut self, state: bool) {
+        self.smoothing = state;
+        self.modified = true;
+    }
+
+    pub fn mesh_division_ratio(&self) -> f32 {
+        self.mesh_division_ratio
+    }
+    pub fn set_mesh_division_ratio(&mut self, ratio: f32) {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.mesh_division_ratio = ratio;
+            self.modified = true;
+        }
+    }
+
+    pub fn queuing(&self) -> bool {
+        self.queuing
+    }
+    pub fn set_queuing(&mut self, state: bool) {
+        self.queuing = state;
+        self.modified = true;
+    }
+
+    pub fn color_rgba(&self) -> u32 {
+        self.color_rgba
+    }
+    pub fn set_color_rgba(&mut self, rgba: u32, _frame_count: f32, _easing: f32) {
+        self.color_rgba = rgba;
+        self.modified = true;
+        self.record_api_call(
+            "SetColor",
+            vec![
+                rgba.to_string(),
+                _frame_count.max(0.0).to_string(),
+                _easing.to_string(),
+            ],
+        );
+    }
+
+    pub fn grayscale(&self) -> f32 {
+        self.grayscale
+    }
+    pub fn set_grayscale(&mut self, rate: f32, _frame_count: f32, _easing: f32) {
+        if rate.is_finite() {
+            self.grayscale = rate.clamp(0.0, 1.0);
+            self.modified = true;
+            self.record_api_call(
+                "SetGrayscale",
+                vec![
+                    self.grayscale.to_string(),
+                    _frame_count.max(0.0).to_string(),
+                    _easing.to_string(),
+                ],
+            );
+        }
+    }
+
+    pub fn as_original_scale(&self) -> bool {
+        self.as_original_scale
+    }
+    pub fn set_as_original_scale(&mut self, state: bool) {
+        self.as_original_scale = state;
+        self.modified = true;
+    }
+
+    pub fn state_value(&self, label: &str) -> f32 {
+        match label {
+            "scale" => self.scale,
+            "rot" => self.rot,
+            "x" => self.coord[0],
+            "y" => self.coord[1],
+            _ => self.variable_value(label).unwrap_or(0.0),
+        }
+    }
+
     pub fn elapsed_ticks(&self) -> f32 {
         self.elapsed_ticks
     }
@@ -277,8 +458,89 @@ impl ElunaPlayer {
         self.timelines.keys().next().map(String::as_str)
     }
 
+    pub fn main_timeline_labels(&self) -> Vec<&str> {
+        self.timelines
+            .values()
+            .filter(|timeline| !timeline.name.starts_with("@control/") && !timeline.is_difference)
+            .map(|timeline| timeline.name.as_str())
+            .collect()
+    }
+
+    pub fn diff_timeline_labels(&self) -> Vec<&str> {
+        self.timelines
+            .values()
+            .filter(|timeline| !timeline.name.starts_with("@control/") && timeline.is_difference)
+            .map(|timeline| timeline.name.as_str())
+            .collect()
+    }
+
+    pub fn playing_timeline_info(&self) -> Vec<(String, u32)> {
+        self.active_timelines
+            .iter()
+            .map(|(name, mode)| (name.clone(), mode.flags))
+            .collect()
+    }
+
+    pub fn timeline_total_frame_count(&self, name: &str) -> Option<f32> {
+        self.timelines
+            .get(name)
+            .map(|timeline| timeline.duration_ticks)
+    }
+
+    pub fn timeline_blend_ratio(&self, name: &str) -> f32 {
+        self.active_timeline_states
+            .get(name)
+            .map(|state| state.blend_ratio)
+            .or_else(|| self.timeline_blend_ratios.get(name).copied())
+            .unwrap_or(0.0)
+    }
+
+    pub fn is_timeline_playing(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return !self.active_timelines.is_empty();
+        }
+        self.active_timelines.contains_key(name)
+    }
+
+    pub fn is_loop_timeline(&self, name: &str) -> bool {
+        self.active_timeline_states
+            .get(name)
+            .map(|state| state.mode.is_looping())
+            .or_else(|| {
+                self.active_timelines
+                    .get(name)
+                    .map(|mode| mode.is_looping())
+            })
+            .unwrap_or(false)
+    }
+
     pub fn variable_value(&self, name: &str) -> Option<f32> {
         self.variables.get(name).map(|state| state.value)
+    }
+
+    pub fn variable_frame_count(&self, name: &str) -> usize {
+        self.variables
+            .get(name)
+            .map(|state| state.info.frames.len())
+            .unwrap_or(0)
+    }
+
+    pub fn variable_frame_label_at(&self, name: &str, index: usize) -> Option<&str> {
+        self.variables
+            .get(name)?
+            .info
+            .frames
+            .get(index)
+            .map(|frame| frame.label.as_str())
+    }
+
+    pub fn variable_frame_value_at(&self, name: &str, index: usize) -> Option<f32> {
+        self.variables
+            .get(name)?
+            .info
+            .frames
+            .get(index)
+            .map(|frame| frame.value)
     }
 
     pub fn pending_writes(&self) -> &[VariableWrite] {
@@ -293,7 +555,10 @@ impl ElunaPlayer {
         self.set_variable_timed(&write.name, write.value, write.time_ticks, write.easing);
     }
 
-    pub fn from_scene_and_variables(scene: EmoteStaticScene, infos: Vec<EmoteVariableInfo>) -> Self {
+    pub fn from_scene_and_variables(
+        scene: EmoteStaticScene,
+        infos: Vec<EmoteVariableInfo>,
+    ) -> Self {
         Self::from_scene_variables_timelines(scene, infos, Vec::new())
     }
 
@@ -302,7 +567,12 @@ impl ElunaPlayer {
         infos: Vec<EmoteVariableInfo>,
         timelines: Vec<EmoteTimeline>,
     ) -> Self {
-        Self::from_scene_variables_timelines_runtime(scene, infos, timelines, EmoteRuntimePipeline::default())
+        Self::from_scene_variables_timelines_runtime(
+            scene,
+            infos,
+            timelines,
+            EmoteRuntimePipeline::default(),
+        )
     }
 
     pub fn from_scene_variables_timelines_runtime(
@@ -325,17 +595,21 @@ impl ElunaPlayer {
         for timeline in timelines {
             for variable in &timeline.variables {
                 let first_value = variable.frames.first().map(|f| f.value).unwrap_or(0.0);
-                variables.entry(variable.name.clone()).or_insert_with(|| EmoteVariableState {
-                    info: EmoteVariableInfo {
-                        name: variable.name.clone(),
-                        default_value: first_value,
-                        min_value: None,
-                        max_value: None,
-                    },
-                    value: first_value,
-                    target: None,
-                });
+                variables
+                    .entry(variable.name.clone())
+                    .or_insert_with(|| EmoteVariableState {
+                        info: EmoteVariableInfo {
+                            name: variable.name.clone(),
+                            default_value: first_value,
+                            min_value: None,
+                            max_value: None,
+                            frames: Vec::new(),
+                        },
+                        value: first_value,
+                        target: None,
+                    });
                 if let Some(state) = variables.get_mut(&variable.name) {
+                    merge_timeline_variable_range(&mut state.info, variable);
                     if (state.value - state.info.default_value).abs() <= f32::EPSILON {
                         state.value = clamp_variable_value(&state.info, first_value);
                     }
@@ -349,22 +623,31 @@ impl ElunaPlayer {
         for (name, timeline) in &timeline_map {
             if is_auto_control_timeline_name(name) {
                 active_timelines.insert(name.clone(), TimelinePlayMode::Loop);
-                active_timeline_states.insert(name.clone(), ActiveTimelineState {
-                    mode: TimelinePlayMode::Loop,
-                    elapsed_ticks: 0.0,
-                });
+                active_timeline_states.insert(
+                    name.clone(),
+                    ActiveTimelineState {
+                        mode: TimelinePlayMode::Loop,
+                        elapsed_ticks: 0.0,
+                        blend_ratio: 1.0,
+                        blend_target: None,
+                    },
+                );
                 for variable in &timeline.variables {
                     let value = evaluate_timeline_variable(variable, 0.0);
-                    let state = variables.entry(variable.name.clone()).or_insert_with(|| EmoteVariableState {
-                        info: EmoteVariableInfo {
-                            name: variable.name.clone(),
-                            default_value: value,
-                            min_value: None,
-                            max_value: None,
-                        },
-                        value,
-                        target: None,
+                    let state = variables.entry(variable.name.clone()).or_insert_with(|| {
+                        EmoteVariableState {
+                            info: EmoteVariableInfo {
+                                name: variable.name.clone(),
+                                default_value: value,
+                                min_value: None,
+                                max_value: None,
+                                frames: Vec::new(),
+                            },
+                            value,
+                            target: None,
+                        }
                     });
+                    merge_timeline_variable_range(&mut state.info, variable);
                     state.value = clamp_variable_value(&state.info, value);
                     state.target = None;
                 }
@@ -376,6 +659,12 @@ impl ElunaPlayer {
 
         let mut player = Self {
             shown: true,
+            smoothing: true,
+            mesh_division_ratio: 1.0,
+            queuing: false,
+            color_rgba: 0xffff_ffff,
+            grayscale: 0.0,
+            as_original_scale: false,
             coord: [0.0, 0.0],
             scale: 1.0,
             rot: 0.0,
@@ -388,9 +677,22 @@ impl ElunaPlayer {
             pending_writes: Vec::new(),
             active_timelines,
             active_timeline_states,
+            timeline_diff_variables: BTreeMap::new(),
+            timeline_blend_ratios: BTreeMap::new(),
             runtime_pipeline,
             bust_states,
             hair_states,
+            outer_forces: BTreeMap::new(),
+            outer_rot: 0.0,
+            transform_order_mask: transform_order_mask::DEFAULT,
+            hair_scale: 1.0,
+            parts_scale: 1.0,
+            bust_scale: 1.0,
+            wind: None,
+            modified: false,
+            recording_api_log: false,
+            replaying_api_log: false,
+            api_log: Vec::new(),
         };
         player.evaluate_runtime_pipeline(0.0);
         player
@@ -416,10 +718,24 @@ impl ElunaPlayer {
         self.physics_enabled
     }
 
+    pub fn evaluate_physics_for_current_scene(&mut self, delta_ticks: f32) {
+        if !self.physics_enabled || !delta_ticks.is_finite() || delta_ticks < 0.0 {
+            return;
+        }
+        self.evaluate_physics_controls(delta_ticks);
+        self.modified = true;
+    }
+
+    pub fn progress_ticks_without_physics(&mut self, delta_ticks: f32) {
+        self.progress_ticks_internal(delta_ticks, false);
+    }
+
     pub fn set_variable_immediate(&mut self, name: &str, value: f32) {
         if let Some(state) = self.variables.get_mut(name) {
             state.value = clamp_variable_value(&state.info, value);
             state.target = None;
+            self.modified = true;
+            self.evaluate_runtime_pipeline(0.0);
         }
     }
 
@@ -428,6 +744,7 @@ impl ElunaPlayer {
             let default = state.info.default_value;
             state.value = default;
             state.target = None;
+            self.modified = true;
         }
     }
 
@@ -437,7 +754,10 @@ impl ElunaPlayer {
     }
 
     pub fn timeline_elapsed_ticks(&self, name: &str) -> f32 {
-        self.active_timeline_states.get(name).map(|s| s.elapsed_ticks).unwrap_or(0.0)
+        self.active_timeline_states
+            .get(name)
+            .map(|s| s.elapsed_ticks)
+            .unwrap_or(0.0)
     }
 
     pub fn set_timeline_time(&mut self, name: &str, ticks: f32) -> Result<(), String> {
@@ -457,11 +777,17 @@ impl ElunaPlayer {
             .or_else(|| self.active_timelines.get(name).copied())
             .unwrap_or(TimelinePlayMode::Once);
         self.active_timelines.insert(name.to_owned(), mode);
-        self.active_timeline_states.insert(name.to_owned(), ActiveTimelineState {
-            mode,
-            elapsed_ticks: local_time,
-        });
-        self.apply_timeline_at(&timeline, local_time);
+        let blend_ratio = self.timeline_blend_ratios.get(name).copied().unwrap_or(1.0);
+        self.active_timeline_states.insert(
+            name.to_owned(),
+            ActiveTimelineState {
+                mode,
+                elapsed_ticks: local_time,
+                blend_ratio,
+                blend_target: None,
+            },
+        );
+        self.reapply_active_timelines_at_current_time();
         self.evaluate_runtime_pipeline(0.0);
         Ok(())
     }
@@ -491,185 +817,19 @@ impl ElunaPlayer {
             state.value = state.info.default_value;
             state.target = None;
         }
+        self.modified = true;
         self.evaluate_runtime_pipeline(0.0);
     }
 
-    fn ensure_variable(&mut self, name: &str) -> &mut EmoteVariableState {
-        self.variables.entry(name.to_owned()).or_insert_with(|| EmoteVariableState {
-            info: EmoteVariableInfo {
-                name: name.to_owned(),
-                default_value: 0.0,
-                min_value: None,
-                max_value: None,
-            },
-            value: 0.0,
-            target: None,
-        })
-    }
-
-    fn progress_active_timelines(&mut self, delta_ticks: f32) {
-        let names: Vec<String> = self.active_timeline_states.keys().cloned().collect();
-        for name in names {
-            let Some(timeline) = self.timelines.get(&name).cloned() else {
-                self.active_timeline_states.remove(&name);
-                self.active_timelines.remove(&name);
-                continue;
-            };
-            let Some(state) = self.active_timeline_states.get_mut(&name) else {
-                continue;
-            };
-
-            state.elapsed_ticks += delta_ticks;
-            let mut local_time = state.elapsed_ticks;
-            let duration = timeline.duration_ticks.max(0.0);
-            if duration > 0.0 && local_time > duration {
-                if state.mode == TimelinePlayMode::Once {
-                    local_time = duration;
-                    state.elapsed_ticks = duration;
-                } else {
-                    local_time = local_time.rem_euclid(duration);
-                    state.elapsed_ticks = local_time;
-                }
-            }
-
-            self.apply_timeline_at(&timeline, local_time);
-        }
-    }
-
-    fn apply_timeline_at(&mut self, timeline: &EmoteTimeline, local_time: f32) {
-        for variable in &timeline.variables {
-            let value = evaluate_timeline_variable(variable, local_time);
-            let state = self.ensure_variable(&variable.name);
-            state.value = clamp_variable_value(&state.info, value);
-            state.target = None;
-        }
-    }
-
-    fn evaluate_runtime_pipeline(&mut self, delta_ticks: f32) {
-        let pipeline = self.runtime_pipeline.clone();
-        for control in &pipeline.selector_controls {
-            evaluate_selector_control(control, &mut self.variables);
-        }
-        for control in &pipeline.clamp_controls {
-            evaluate_clamp_control(control, &mut self.variables);
-        }
-        for control in &pipeline.loop_controls {
-            evaluate_loop_control(control, &mut self.variables);
-        }
-        if let Some(control) = &pipeline.mirror_control {
-            evaluate_mirror_control(control, &mut self.variables);
-        }
-        for control in &pipeline.transition_controls {
-            evaluate_transition_control(control, &mut self.variables);
-        }
-        evaluate_opaque_controls("partsControl", &pipeline.parts_controls);
-        evaluate_opaque_controls("eyeControl", &pipeline.eye_controls);
-        evaluate_opaque_controls("eyebrowControl", &pipeline.eyebrow_controls);
-        evaluate_opaque_controls("mouthControl", &pipeline.mouth_controls);
-
-        if self.physics_enabled {
-            let mut bust_idx = 0;
-            let mut hair_idx = 0;
-            for control in &pipeline.physics_controls {
-                match control {
-                    PhysicsControl::Bust(def) => {
-                        if let Some(state) = self.bust_states.get_mut(bust_idx) {
-                            step_bust_physics(state, def, delta_ticks, &mut self.variables);
-                        }
-                        bust_idx += 1;
-                    }
-                    PhysicsControl::Hair(def) => {
-                        if let Some(state) = self.hair_states.get_mut(hair_idx) {
-                            step_hair_physics(state, def, delta_ticks, &mut self.variables);
-                        }
-                        hair_idx += 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl EmotePlayerControl for ElunaPlayer {
-    fn show(&mut self) {
-        self.shown = true;
-    }
-
-    fn hide(&mut self) {
-        self.shown = false;
-    }
-
-    fn progress_ticks(&mut self, delta_ticks: f32) {
-        if !delta_ticks.is_finite() || delta_ticks <= 0.0 {
-            return;
-        }
-        self.elapsed_ticks += delta_ticks;
-
-        if !self.paused {
-            self.progress_active_timelines(delta_ticks);
-        }
-        self.evaluate_runtime_pipeline(delta_ticks);
-
-        for state in self.variables.values_mut() {
-            let Some(mut target) = state.target.take() else {
-                continue;
-            };
-
-            target.elapsed_ticks = (target.elapsed_ticks + delta_ticks).min(target.duration_ticks.max(0.0));
-            let t = if target.duration_ticks <= 0.0 {
-                1.0
-            } else {
-                (target.elapsed_ticks / target.duration_ticks).clamp(0.0, 1.0)
-            };
-            let eased = preview_easing(t, target.easing);
-            let mut value = target.start_value + (target.target_value - target.start_value) * eased;
-            if let Some(min) = state.info.min_value {
-                value = value.max(min);
-            }
-            if let Some(max) = state.info.max_value {
-                value = value.min(max);
-            }
-            state.value = value;
-
-            if t < 1.0 {
-                state.target = Some(target);
-            }
-        }
-    }
-
-    fn render(&mut self) {}
-
-    fn coord(&self) -> [f32; 2] {
-        self.coord
-    }
-
-    fn set_coord(&mut self, x: f32, y: f32) {
-        self.coord = [x, y];
-    }
-
-    fn scale(&self) -> f32 {
-        self.scale
-    }
-
-    fn set_scale(&mut self, scale: f32) {
-        if scale.is_finite() && scale > 0.0 {
-            self.scale = scale;
-        }
-    }
-
-    fn rot(&self) -> f32 {
-        self.rot
-    }
-
-    fn set_rot(&mut self, rot: f32) {
-        if rot.is_finite() {
-            self.rot = rot;
-        }
-    }
-
-    fn set_variable_timed(&mut self, name: &str, value: f32, time_ticks: f32, easing: f32) {
+    fn set_variable_timed_internal(
+        &mut self,
+        name: &str,
+        value: f32,
+        time_ticks: f32,
+        easing: f32,
+    ) -> Option<f32> {
         if name.is_empty() || !value.is_finite() {
-            return;
+            return None;
         }
 
         let state = self.ensure_variable(name);
@@ -694,26 +854,833 @@ impl EmotePlayerControl for ElunaPlayer {
             });
         }
 
-        self.pending_writes.push(VariableWrite::timed(name, target_value, time_ticks.max(0.0), easing));
+        self.pending_writes.push(VariableWrite::timed(
+            name,
+            target_value,
+            time_ticks.max(0.0),
+            easing,
+        ));
+        self.modified = true;
+        Some(target_value)
     }
 
-    fn play_timeline(&mut self, name: &str, mode: TimelinePlayMode) {
-        if !name.is_empty() {
-            self.active_timelines.insert(name.to_owned(), mode);
-            self.active_timeline_states.insert(name.to_owned(), ActiveTimelineState {
-                mode,
-                elapsed_ticks: 0.0,
-            });
-            if let Some(timeline) = self.timelines.get(name).cloned() {
-                self.apply_timeline_at(&timeline, 0.0);
-                self.evaluate_runtime_pipeline(0.0);
+    pub fn variable_diff_value(&self, module: &str, name: &str) -> Option<f32> {
+        self.variable_value(&format!("{module}/{name}"))
+    }
+
+    pub fn is_animating(&self) -> bool {
+        if self
+            .active_timeline_states
+            .values()
+            .any(|state| state.blend_ratio > 0.0)
+        {
+            return true;
+        }
+        self.variables.values().any(|state| state.target.is_some()) || self.wind.is_some()
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.modified
+    }
+
+    pub fn clear_modified(&mut self) {
+        self.modified = false;
+    }
+
+    pub fn pass(&mut self) {
+        self.reapply_active_timelines_at_current_time();
+        self.evaluate_runtime_pipeline(0.0);
+        self.modified = true;
+        self.record_api_call("Pass", Vec::new());
+    }
+
+    pub fn step(&mut self) {
+        <Self as EmotePlayerControl>::progress_ticks(self, 1.0);
+        self.record_api_call("Step", Vec::new());
+    }
+
+    pub fn start_record_api_log(&mut self) {
+        self.api_log.clear();
+        self.recording_api_log = true;
+    }
+
+    pub fn stop_record_api_log(&mut self) {
+        self.recording_api_log = false;
+    }
+
+    pub fn is_recording_api_log(&self) -> bool {
+        self.recording_api_log
+    }
+
+    pub fn start_replay_api_log(&mut self) {
+        self.replaying_api_log = true;
+    }
+
+    pub fn stop_replay_api_log(&mut self) {
+        self.replaying_api_log = false;
+    }
+
+    pub fn is_replaying_api_log(&self) -> bool {
+        self.replaying_api_log
+    }
+
+    pub fn clear_api_log(&mut self) {
+        self.api_log.clear();
+    }
+
+    pub fn api_log(&self) -> String {
+        self.api_log
+            .iter()
+            .map(EmoteApiLogEntry::encode)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn set_api_log(&mut self, log: &str) {
+        self.api_log = log.lines().filter_map(parse_api_log_entry).collect();
+    }
+
+    pub fn replay_api_log_once(&mut self) {
+        let entries = self.api_log.clone();
+        for entry in entries {
+            self.apply_api_log_entry(&entry);
+        }
+    }
+
+    fn record_api_call(&mut self, command: &str, args: Vec<String>) {
+        if self.recording_api_log && !self.replaying_api_log {
+            self.api_log.push(EmoteApiLogEntry::new(command, args));
+        }
+    }
+
+    fn apply_api_log_entry(&mut self, entry: &EmoteApiLogEntry) {
+        self.replaying_api_log = true;
+        match entry.command.as_str() {
+            "SetVariable" if entry.args.len() >= 4 => {
+                if let (Ok(value), Ok(frame_count), Ok(easing)) = (
+                    entry.args[1].parse::<f32>(),
+                    entry.args[2].parse::<f32>(),
+                    entry.args[3].parse::<f32>(),
+                ) {
+                    self.set_variable_timed(&entry.args[0], value, frame_count, easing);
+                }
+            }
+            "SetVariableDiff" if entry.args.len() >= 5 => {
+                if let (Ok(value), Ok(frame_count), Ok(easing)) = (
+                    entry.args[2].parse::<f32>(),
+                    entry.args[3].parse::<f32>(),
+                    entry.args[4].parse::<f32>(),
+                ) {
+                    self.set_variable_diff(
+                        &entry.args[0],
+                        &entry.args[1],
+                        value,
+                        frame_count,
+                        easing,
+                    );
+                }
+            }
+            "PlayTimeline" if entry.args.len() >= 2 => {
+                if let Ok(flags) = entry.args[1].parse::<u32>() {
+                    self.play_timeline(
+                        &entry.args[0],
+                        TimelinePlayMode {
+                            flags,
+                            looping: false,
+                        },
+                    );
+                }
+            }
+            "StopTimeline" if !entry.args.is_empty() => self.stop_timeline(&entry.args[0]),
+            "SetTimelineBlendRatio" if entry.args.len() >= 5 => {
+                if let (Ok(value), Ok(frame_count), Ok(easing), Ok(stop_when_done)) = (
+                    entry.args[1].parse::<f32>(),
+                    entry.args[2].parse::<f32>(),
+                    entry.args[3].parse::<f32>(),
+                    entry.args[4].parse::<bool>(),
+                ) {
+                    self.set_timeline_blend_ratio(
+                        &entry.args[0],
+                        value,
+                        frame_count,
+                        easing,
+                        stop_when_done,
+                    );
+                }
+            }
+            "SetOuterForce" if entry.args.len() >= 5 => {
+                if let (Ok(x), Ok(y), Ok(frame_count), Ok(easing)) = (
+                    entry.args[1].parse::<f32>(),
+                    entry.args[2].parse::<f32>(),
+                    entry.args[3].parse::<f32>(),
+                    entry.args[4].parse::<f32>(),
+                ) {
+                    self.set_outer_force(&entry.args[0], x, y, frame_count, easing);
+                }
+            }
+            "SetOuterRot" if entry.args.len() >= 3 => {
+                if let (Ok(rot), Ok(frame_count), Ok(easing)) = (
+                    entry.args[0].parse::<f32>(),
+                    entry.args[1].parse::<f32>(),
+                    entry.args[2].parse::<f32>(),
+                ) {
+                    self.set_outer_rot(rot, frame_count, easing);
+                }
+            }
+            "SetCoord" if entry.args.len() >= 2 => {
+                if let (Ok(x), Ok(y)) = (entry.args[0].parse::<f32>(), entry.args[1].parse::<f32>())
+                {
+                    self.set_coord(x, y);
+                }
+            }
+            "SetScale" if !entry.args.is_empty() => {
+                if let Ok(scale) = entry.args[0].parse::<f32>() {
+                    self.set_scale(scale);
+                }
+            }
+            "SetRot" if !entry.args.is_empty() => {
+                if let Ok(rot) = entry.args[0].parse::<f32>() {
+                    self.set_rot(rot);
+                }
+            }
+            "Progress" if !entry.args.is_empty() => {
+                if let Ok(frame_count) = entry.args[0].parse::<f32>() {
+                    <Self as EmotePlayerControl>::progress_ticks(self, frame_count);
+                }
+            }
+            _ => {}
+        }
+        self.replaying_api_log = false;
+    }
+
+    fn ensure_variable(&mut self, name: &str) -> &mut EmoteVariableState {
+        self.variables
+            .entry(name.to_owned())
+            .or_insert_with(|| EmoteVariableState {
+                info: EmoteVariableInfo {
+                    name: name.to_owned(),
+                    default_value: 0.0,
+                    min_value: None,
+                    max_value: None,
+                    frames: Vec::new(),
+                },
+                value: 0.0,
+                target: None,
+            })
+    }
+
+    fn reset_timeline_variables_to_default(&mut self) {
+        let mut names = Vec::new();
+        for timeline in self.timelines.values() {
+            for variable in &timeline.variables {
+                names.push(variable.name.clone());
+            }
+        }
+        names.sort();
+        names.dedup();
+        for name in names {
+            if let Some(state) = self.variables.get_mut(&name) {
+                state.value = state.info.default_value;
+                state.target = None;
             }
         }
     }
 
+    fn reapply_active_timelines_at_current_time(&mut self) {
+        let mut applications = Vec::new();
+        for (name, state) in self.active_timeline_states.clone() {
+            let Some(timeline) = self.timelines.get(&name).cloned() else {
+                continue;
+            };
+            applications.push((timeline, state.elapsed_ticks, state.mode, state.blend_ratio));
+        }
+        applications.sort_by(|a, b| {
+            a.2.is_difference()
+                .cmp(&b.2.is_difference())
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+        self.reset_timeline_variables_to_default();
+        for (timeline, local_time, mode, blend_ratio) in applications {
+            self.apply_timeline_at(&timeline, local_time, mode, blend_ratio);
+        }
+    }
+
+    fn progress_active_timelines(&mut self, delta_ticks: f32) {
+        let names: Vec<String> = self.active_timeline_states.keys().cloned().collect();
+        let mut applications = Vec::new();
+        for name in names {
+            let Some(timeline) = self.timelines.get(&name).cloned() else {
+                self.active_timeline_states.remove(&name);
+                self.active_timelines.remove(&name);
+                continue;
+            };
+            let Some(state) = self.active_timeline_states.get_mut(&name) else {
+                continue;
+            };
+
+            state.elapsed_ticks += delta_ticks;
+            let mut local_time = state.elapsed_ticks;
+            let duration = timeline.duration_ticks.max(0.0);
+            if duration > 0.0 && local_time > duration {
+                if !state.mode.is_looping() {
+                    local_time = duration;
+                    state.elapsed_ticks = duration;
+                } else {
+                    local_time = local_time.rem_euclid(duration);
+                    state.elapsed_ticks = local_time;
+                }
+            }
+
+            let mode = state.mode;
+            let blend_ratio = advance_timeline_blend(state, delta_ticks);
+            self.timeline_blend_ratios.insert(name.clone(), blend_ratio);
+            applications.push((timeline, local_time, mode, blend_ratio));
+        }
+
+        applications.sort_by(|a, b| {
+            a.2.is_difference()
+                .cmp(&b.2.is_difference())
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+        self.reset_timeline_variables_to_default();
+        for (timeline, local_time, mode, blend_ratio) in applications {
+            self.apply_timeline_at(&timeline, local_time, mode, blend_ratio);
+        }
+    }
+
+    fn apply_timeline_at(
+        &mut self,
+        timeline: &EmoteTimeline,
+        local_time: f32,
+        mode: TimelinePlayMode,
+        blend_ratio: f32,
+    ) {
+        let blend_ratio = blend_ratio.clamp(0.0, 1.0);
+        for variable in &timeline.variables {
+            let evaluated = evaluate_timeline_variable(variable, local_time);
+            let state = self.ensure_variable(&variable.name);
+            let value = if mode.is_difference() {
+                state.value + (evaluated - state.info.default_value) * blend_ratio
+            } else {
+                state.info.default_value + (evaluated - state.info.default_value) * blend_ratio
+            };
+            state.value = clamp_variable_value(&state.info, value);
+            state.target = None;
+        }
+    }
+
+    fn evaluate_runtime_pipeline(&mut self, delta_ticks: f32) {
+        let pipeline = self.runtime_pipeline.clone();
+        // selectorControl is the only top-level control whose PSB schema is
+        // really an optionList of {label, offValue, onValue}.  eyeControl,
+        // eyebrowControl, mouthControl, partsControl, hairControl, bustControl
+        // have their own fields per the reverse notes (blink timers, talk
+        // labels, EPPendControl / EPBustControl physics parameters).  Their
+        // dedicated evaluators are not yet implemented; parts/hair/bust still
+        // drive their variables through the physics block below, while
+        // eye/eyebrow/mouth remain parsed but unevaluated rather than being
+        // misapplied through a selector-style writer.
+        for control in &pipeline.selector_controls {
+            evaluate_selector_control(control, &mut self.variables);
+        }
+        for control in &pipeline.transition_controls {
+            evaluate_transition_control(control, &mut self.variables);
+        }
+        for control in &pipeline.loop_controls {
+            evaluate_loop_control(control, self.elapsed_ticks, &mut self.variables);
+        }
+        if let Some(control) = &pipeline.mirror_control {
+            evaluate_mirror_control(control, &mut self.variables);
+        }
+        for control in &pipeline.clamp_controls {
+            evaluate_clamp_control(control, &mut self.variables);
+        }
+
+        if self.physics_enabled {
+            self.evaluate_physics_controls(delta_ticks);
+        }
+    }
+
+    fn evaluate_physics_controls(&mut self, delta_ticks: f32) {
+        if delta_ticks <= PHYSICS_EPSILON_TICKS {
+            return;
+        }
+        let pipeline = self.runtime_pipeline.clone();
+        let mut bust_idx = 0;
+        let mut pend_idx = 0;
+        for control in &pipeline.physics_controls {
+            match control {
+                PhysicsControl::Bust(def) => {
+                    let (anchor, angle) = self.layer_world_pose(def.base_layer.as_deref());
+                    let outer_force = self.outer_force("bust");
+                    let scale = self.bust_scale;
+                    if let Some(state) = self.bust_states.get_mut(bust_idx) {
+                        step_bust_physics(
+                            state,
+                            def,
+                            delta_ticks,
+                            anchor,
+                            angle + self.outer_rot,
+                            outer_force,
+                            scale,
+                            &mut self.variables,
+                        );
+                    }
+                    bust_idx += 1;
+                }
+                PhysicsControl::Hair(def) => {
+                    let (anchor, angle) = self.layer_world_pose(def.base_layer.as_deref());
+                    let outer_force = self.outer_force("hair");
+                    let scale = self.hair_scale;
+                    if let Some(state) = self.hair_states.get_mut(pend_idx) {
+                        step_hair_physics(
+                            state,
+                            def,
+                            delta_ticks,
+                            anchor,
+                            angle + self.outer_rot,
+                            outer_force,
+                            scale,
+                            &mut self.variables,
+                        );
+                    }
+                    pend_idx += 1;
+                }
+                PhysicsControl::Parts(def) => {
+                    let (anchor, angle) = self.layer_world_pose(def.base_layer.as_deref());
+                    let outer_force = self.outer_force("parts");
+                    let scale = self.parts_scale;
+                    if let Some(state) = self.hair_states.get_mut(pend_idx) {
+                        step_hair_physics(
+                            state,
+                            def,
+                            delta_ticks,
+                            anchor,
+                            angle + self.outer_rot,
+                            outer_force,
+                            scale,
+                            &mut self.variables,
+                        );
+                    }
+                    pend_idx += 1;
+                }
+            }
+        }
+    }
+
+    fn progress_ticks_internal(&mut self, delta_ticks: f32, include_physics: bool) {
+        if !delta_ticks.is_finite() || delta_ticks <= 0.0 {
+            return;
+        }
+        self.elapsed_ticks += delta_ticks;
+
+        if !self.paused {
+            self.progress_active_timelines(delta_ticks);
+        }
+        if include_physics {
+            self.evaluate_runtime_pipeline(delta_ticks);
+        } else {
+            let was_enabled = self.physics_enabled;
+            self.physics_enabled = false;
+            self.evaluate_runtime_pipeline(0.0);
+            self.physics_enabled = was_enabled;
+        }
+        self.modified = true;
+
+        for state in self.variables.values_mut() {
+            let Some(mut target) = state.target.take() else {
+                continue;
+            };
+
+            target.elapsed_ticks =
+                (target.elapsed_ticks + delta_ticks).min(target.duration_ticks.max(0.0));
+            let t = if target.duration_ticks <= 0.0 {
+                1.0
+            } else {
+                (target.elapsed_ticks / target.duration_ticks).clamp(0.0, 1.0)
+            };
+            let eased = preview_easing(t, target.easing);
+            let mut value = target.start_value + (target.target_value - target.start_value) * eased;
+            if let Some(min) = state.info.min_value {
+                value = value.max(min);
+            }
+            if let Some(max) = state.info.max_value {
+                value = value.min(max);
+            }
+            state.value = value;
+
+            if t < 1.0 {
+                state.target = Some(target);
+            }
+        }
+    }
+
+    fn layer_world_pose(&self, base_layer: Option<&str>) -> ([f32; 3], f32) {
+        let Some(base_layer) = base_layer.filter(|s| !s.is_empty()) else {
+            return ([0.0, 0.0, 0.0], 0.0);
+        };
+        if let Some(layer) = self.scene.layer_states.iter().find(|layer| {
+            layer.path == base_layer
+                || layer.draw_frame_info.layer_label.as_deref() == Some(base_layer)
+                || layer.path.ends_with(base_layer)
+        }) {
+            let m = layer.transform;
+            let x = m[4];
+            let y = m[5];
+            let angle = m[2].atan2(m[0]);
+            return ([x, y, 0.0], angle);
+        }
+        let sprite = self.scene.sprites.iter().find(|sprite| {
+            sprite.draw_frame_info.path == base_layer
+                || sprite.label.as_deref() == Some(base_layer)
+                || sprite.draw_frame_info.layer_label.as_deref() == Some(base_layer)
+                || sprite.draw_frame_info.path.ends_with(base_layer)
+        });
+        let Some(sprite) = sprite else {
+            return ([0.0, 0.0, 0.0], 0.0);
+        };
+        let m = sprite.world_transform;
+        let x = m[0] * sprite.center_x + m[1] * sprite.center_y + m[4];
+        let y = m[2] * sprite.center_x + m[3] * sprite.center_y + m[5];
+        let angle = m[2].atan2(m[0]);
+        ([x, y, 0.0], angle)
+    }
+}
+
+impl EmotePlayerControl for ElunaPlayer {
+    fn show(&mut self) {
+        self.shown = true;
+    }
+
+    fn hide(&mut self) {
+        self.shown = false;
+    }
+
+    fn progress_ticks(&mut self, delta_ticks: f32) {
+        self.progress_ticks_internal(delta_ticks, true);
+    }
+
+    fn render(&mut self) {}
+
+    fn coord(&self) -> [f32; 2] {
+        self.coord
+    }
+
+    fn set_coord(&mut self, x: f32, y: f32) {
+        if x.is_finite() && y.is_finite() {
+            self.coord = [x, y];
+            self.modified = true;
+            self.record_api_call(
+                "SetCoord",
+                vec![x.to_string(), y.to_string(), "0".to_owned(), "0".to_owned()],
+            );
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    fn set_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale;
+            self.modified = true;
+            self.record_api_call(
+                "SetScale",
+                vec![scale.to_string(), "0".to_owned(), "0".to_owned()],
+            );
+        }
+    }
+
+    fn rot(&self) -> f32 {
+        self.rot
+    }
+
+    fn set_rot(&mut self, rot: f32) {
+        if rot.is_finite() {
+            self.rot = rot;
+            self.modified = true;
+            self.record_api_call(
+                "SetRot",
+                vec![rot.to_string(), "0".to_owned(), "0".to_owned()],
+            );
+        }
+    }
+
+    fn set_variable_timed(&mut self, name: &str, value: f32, time_ticks: f32, easing: f32) {
+        if let Some(target_value) =
+            self.set_variable_timed_internal(name, value, time_ticks, easing)
+        {
+            self.record_api_call(
+                "SetVariable",
+                vec![
+                    name.to_owned(),
+                    target_value.to_string(),
+                    time_ticks.max(0.0).to_string(),
+                    easing.to_string(),
+                ],
+            );
+        }
+    }
+
+    fn set_variable_diff(
+        &mut self,
+        module: &str,
+        name: &str,
+        value: f32,
+        time_ticks: f32,
+        easing: f32,
+    ) {
+        if module.is_empty() || name.is_empty() {
+            return;
+        }
+        let full_name = format!("{module}/{name}");
+        if self
+            .set_variable_timed_internal(&full_name, value, time_ticks, easing)
+            .is_some()
+        {
+            self.record_api_call(
+                "SetVariableDiff",
+                vec![
+                    module.to_owned(),
+                    name.to_owned(),
+                    value.to_string(),
+                    time_ticks.max(0.0).to_string(),
+                    easing.to_string(),
+                ],
+            );
+        }
+    }
+
+    fn play_timeline(&mut self, name: &str, mode: TimelinePlayMode) {
+        if !name.is_empty() {
+            if !mode.is_difference() && !name.starts_with("@control/") {
+                let old_main: Vec<String> = self
+                    .active_timelines
+                    .iter()
+                    .filter(|(active_name, active_mode)| {
+                        !active_name.starts_with("@control/")
+                            && !active_mode.is_difference()
+                            && active_name.as_str() != name
+                    })
+                    .map(|(active_name, _)| active_name.clone())
+                    .collect();
+                for old in old_main {
+                    self.active_timelines.remove(&old);
+                    self.active_timeline_states.remove(&old);
+                    self.timeline_blend_ratios.remove(&old);
+                }
+            }
+
+            self.active_timelines.insert(name.to_owned(), mode);
+            let blend_ratio = self.timeline_blend_ratios.get(name).copied().unwrap_or(1.0);
+            self.active_timeline_states.insert(
+                name.to_owned(),
+                ActiveTimelineState {
+                    mode,
+                    elapsed_ticks: 0.0,
+                    blend_ratio,
+                    blend_target: None,
+                },
+            );
+            self.reapply_active_timelines_at_current_time();
+            self.evaluate_runtime_pipeline(0.0);
+            self.modified = true;
+            self.record_api_call(
+                "PlayTimeline",
+                vec![name.to_owned(), mode.flags.to_string()],
+            );
+        }
+    }
+
     fn stop_timeline(&mut self, name: &str) {
-        self.active_timelines.remove(name);
-        self.active_timeline_states.remove(name);
+        if name.is_empty() {
+            self.active_timelines.clear();
+            self.active_timeline_states.clear();
+            self.timeline_blend_ratios.clear();
+        } else {
+            self.active_timelines.remove(name);
+            self.active_timeline_states.remove(name);
+            self.timeline_blend_ratios.remove(name);
+        }
+        self.reapply_active_timelines_at_current_time();
+        self.evaluate_runtime_pipeline(0.0);
+        self.modified = true;
+        self.record_api_call("StopTimeline", vec![name.to_owned()]);
+    }
+
+    fn set_timeline_blend_ratio(
+        &mut self,
+        name: &str,
+        value: f32,
+        time_ticks: f32,
+        easing: f32,
+        stop_when_done: bool,
+    ) {
+        if name.is_empty() || !value.is_finite() {
+            return;
+        }
+        let target_value = value.clamp(0.0, 1.0);
+        let next_ratio = {
+            let entry = self
+                .active_timeline_states
+                .entry(name.to_owned())
+                .or_insert_with(|| ActiveTimelineState {
+                    mode: self
+                        .active_timelines
+                        .get(name)
+                        .copied()
+                        .unwrap_or(TimelinePlayMode::PARALLEL),
+                    elapsed_ticks: 0.0,
+                    blend_ratio: self.timeline_blend_ratios.get(name).copied().unwrap_or(1.0),
+                    blend_target: None,
+                });
+            if time_ticks <= 0.0 || !time_ticks.is_finite() {
+                entry.blend_ratio = target_value;
+                entry.blend_target = None;
+            } else {
+                entry.blend_target = Some(TimelineBlendTarget {
+                    start_value: entry.blend_ratio,
+                    target_value,
+                    elapsed_ticks: 0.0,
+                    duration_ticks: time_ticks,
+                    easing,
+                    stop_when_done,
+                });
+            }
+            entry.blend_ratio
+        };
+        self.timeline_blend_ratios
+            .insert(name.to_owned(), next_ratio);
+        self.modified = true;
+        self.record_api_call(
+            "SetTimelineBlendRatio",
+            vec![
+                name.to_owned(),
+                target_value.to_string(),
+                time_ticks.max(0.0).to_string(),
+                easing.to_string(),
+                stop_when_done.to_string(),
+            ],
+        );
+    }
+
+    fn fade_in_timeline(&mut self, name: &str, time_ticks: f32, easing: f32) {
+        if !self.active_timelines.contains_key(name) {
+            self.play_timeline(name, TimelinePlayMode::PARALLEL);
+        }
+        self.set_timeline_blend_ratio(name, 1.0, time_ticks, easing, false);
+    }
+
+    fn fade_out_timeline(&mut self, name: &str, time_ticks: f32, easing: f32) {
+        self.set_timeline_blend_ratio(name, 0.0, time_ticks, easing, true);
+    }
+
+    fn set_outer_force(&mut self, label: &str, x: f32, y: f32, _time_ticks: f32, _easing: f32) {
+        if label.is_empty() || !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.outer_forces.insert(label.to_owned(), [x, y]);
+        self.modified = true;
+        self.record_api_call(
+            "SetOuterForce",
+            vec![
+                label.to_owned(),
+                x.to_string(),
+                y.to_string(),
+                _time_ticks.max(0.0).to_string(),
+                _easing.to_string(),
+            ],
+        );
+    }
+
+    fn outer_force(&self, label: &str) -> [f32; 2] {
+        self.outer_forces.get(label).copied().unwrap_or([0.0, 0.0])
+    }
+
+    fn set_outer_rot(&mut self, rot: f32, _time_ticks: f32, _easing: f32) {
+        if rot.is_finite() {
+            self.outer_rot = rot;
+            self.modified = true;
+            self.record_api_call(
+                "SetOuterRot",
+                vec![
+                    rot.to_string(),
+                    _time_ticks.max(0.0).to_string(),
+                    _easing.to_string(),
+                ],
+            );
+        }
+    }
+
+    fn outer_rot(&self) -> f32 {
+        self.outer_rot
+    }
+
+    fn start_wind(&mut self, start: f32, goal: f32, speed: f32, pow_min: f32, pow_max: f32) {
+        self.wind = Some(WindState {
+            start,
+            goal,
+            speed,
+            pow_min,
+            pow_max,
+            elapsed_ticks: 0.0,
+        });
+        self.modified = true;
+        self.record_api_call(
+            "StartWind",
+            vec![
+                start.to_string(),
+                goal.to_string(),
+                speed.to_string(),
+                pow_min.to_string(),
+                pow_max.to_string(),
+            ],
+        );
+    }
+
+    fn stop_wind(&mut self) {
+        self.wind = None;
+        self.modified = true;
+        self.record_api_call("StopWind", Vec::new());
+    }
+
+    fn set_transform_order_mask(&mut self, mask: u32) {
+        self.transform_order_mask = mask;
+    }
+
+    fn transform_order_mask(&self) -> u32 {
+        self.transform_order_mask
+    }
+
+    fn set_hair_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale >= 0.0 {
+            self.hair_scale = scale;
+        }
+    }
+
+    fn hair_scale(&self) -> f32 {
+        self.hair_scale
+    }
+
+    fn set_parts_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale >= 0.0 {
+            self.parts_scale = scale;
+        }
+    }
+
+    fn parts_scale(&self) -> f32 {
+        self.parts_scale
+    }
+
+    fn set_bust_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale >= 0.0 {
+            self.bust_scale = scale;
+        }
+    }
+
+    fn bust_scale(&self) -> f32 {
+        self.bust_scale
     }
 
     fn skip(&mut self) {
@@ -723,6 +1690,29 @@ impl EmotePlayerControl for ElunaPlayer {
             }
         }
     }
+}
+
+fn advance_timeline_blend(state: &mut ActiveTimelineState, delta_ticks: f32) -> f32 {
+    let Some(mut target) = state.blend_target.take() else {
+        return state.blend_ratio.clamp(0.0, 1.0);
+    };
+
+    target.elapsed_ticks =
+        (target.elapsed_ticks + delta_ticks.max(0.0)).min(target.duration_ticks.max(0.0));
+    let t = if target.duration_ticks <= 0.0 {
+        1.0
+    } else {
+        (target.elapsed_ticks / target.duration_ticks).clamp(0.0, 1.0)
+    };
+    let eased = preview_easing(t, target.easing);
+    state.blend_ratio =
+        (target.start_value + (target.target_value - target.start_value) * eased).clamp(0.0, 1.0);
+    if t < 1.0 {
+        state.blend_target = Some(target);
+    } else if target.stop_when_done && state.blend_ratio <= 0.0 {
+        state.elapsed_ticks = 0.0;
+    }
+    state.blend_ratio
 }
 
 fn preview_easing(t: f32, easing: f32) -> f32 {
@@ -739,7 +1729,6 @@ fn preview_easing(t: f32, easing: f32) -> f32 {
     }
 }
 
-
 fn clamp_variable_value(info: &EmoteVariableInfo, mut value: f32) -> f32 {
     if let Some(min) = info.min_value {
         value = value.max(min);
@@ -748,6 +1737,20 @@ fn clamp_variable_value(info: &EmoteVariableInfo, mut value: f32) -> f32 {
         value = value.min(max);
     }
     value
+}
+
+fn merge_timeline_variable_range(info: &mut EmoteVariableInfo, variable: &EmoteTimelineVariable) {
+    for frame in &variable.frames {
+        merge_range_value(&mut info.min_value, &mut info.max_value, frame.value);
+    }
+}
+
+fn merge_range_value(min_value: &mut Option<f32>, max_value: &mut Option<f32>, value: f32) {
+    if !value.is_finite() {
+        return;
+    }
+    *min_value = Some(min_value.map_or(value, |min| min.min(value)));
+    *max_value = Some(max_value.map_or(value, |max| max.max(value)));
 }
 
 fn evaluate_timeline_variable(variable: &EmoteTimelineVariable, time_ticks: f32) -> f32 {
@@ -783,22 +1786,40 @@ pub fn collect_emote_runtime_pipeline(psb: &PsbFile) -> EmoteRuntimePipeline {
     pipeline.instant_variables = metadata
         .field("instantVariableList")
         .and_then(PsbValue::as_list)
-        .map(|items| items.iter().filter_map(PsbValue::as_str).map(str::to_owned).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(PsbValue::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default();
     pipeline.selector_controls = parse_selector_controls(metadata.field("selectorControl"));
     pipeline.clamp_controls = parse_clamp_controls(metadata.field("clampControl"));
     pipeline.loop_controls = parse_loop_controls(metadata.field("loopControl"));
     pipeline.mirror_control = parse_mirror_control(metadata.field("mirrorControl"));
     pipeline.transition_controls = parse_transition_controls(metadata.field("transitionControl"));
-    pipeline.physics_controls.extend(parse_physics_controls(metadata.field("bustControl"), true));
-    pipeline.physics_controls.extend(parse_physics_controls(metadata.field("hairControl"), false));
+    pipeline.physics_controls.extend(parse_physics_controls(
+        metadata.field("bustControl"),
+        PhysicsControlKind::Bust,
+    ));
+    pipeline.physics_controls.extend(parse_physics_controls(
+        metadata.field("hairControl"),
+        PhysicsControlKind::Hair,
+    ));
+    pipeline.physics_controls.extend(parse_physics_controls(
+        metadata.field("partsControl"),
+        PhysicsControlKind::Parts,
+    ));
     pipeline.parts_controls = parse_opaque_controls(metadata.field("partsControl"));
     pipeline.eye_controls = parse_opaque_controls(metadata.field("eyeControl"));
     pipeline.eyebrow_controls = parse_opaque_controls(metadata.field("eyebrowControl"));
     pipeline.mouth_controls = parse_opaque_controls(metadata.field("mouthControl"));
 
     if metadata.field("physicsVariableList").is_none() {
-        pipeline.unsupported_fields.push("metadata.physicsVariableList is absent in this PSB".to_owned());
+        pipeline
+            .unsupported_fields
+            .push("metadata.physicsVariableList is absent in this PSB".to_owned());
     }
     pipeline
 }
@@ -857,22 +1878,39 @@ fn parse_loop_controls(value: Option<&PsbValue>) -> Vec<LoopControl> {
         .unwrap_or(&[])
         .iter()
         .map(|control| {
-            let transition_labels = control
+            let transition_list = control
                 .field("transitionList")
                 .and_then(PsbValue::as_list)
                 .unwrap_or(&[])
                 .iter()
-                .filter_map(|item| item.field_str("label").or_else(|| item.as_str()))
-                .map(str::to_owned)
+                .filter_map(parse_loop_transition)
                 .collect();
             LoopControl {
                 label: control.field_str("label").map(str::to_owned),
                 enabled: control.field_i64("enabled").unwrap_or(1) != 0,
                 var_loop: control.field_str("var_loop").map(str::to_owned),
-                transition_labels,
+                transition_list,
             }
         })
         .collect()
+}
+
+fn parse_loop_transition(value: &PsbValue) -> Option<LoopTransition> {
+    if let Some(items) = value.as_list() {
+        return Some(LoopTransition {
+            start: items.first().and_then(PsbValue::as_f32)?,
+            end: items.get(1).and_then(PsbValue::as_f32)?,
+            duration_ticks: items.get(2).and_then(PsbValue::as_f32)?.max(0.0),
+        });
+    }
+    Some(LoopTransition {
+        start: value.field_f32("start")?,
+        end: value.field_f32("end")?,
+        duration_ticks: value
+            .field_f32("duration")
+            .or_else(|| value.field_f32("duration_ticks"))?
+            .max(0.0),
+    })
 }
 
 fn parse_mirror_control(value: Option<&PsbValue>) -> Option<MirrorControl> {
@@ -885,7 +1923,9 @@ fn parse_mirror_control(value: Option<&PsbValue>) -> Option<MirrorControl> {
         .filter_map(PsbValue::as_str)
         .map(str::to_owned)
         .collect();
-    Some(MirrorControl { variable_match_list })
+    Some(MirrorControl {
+        variable_match_list,
+    })
 }
 
 fn parse_transition_controls(value: Option<&PsbValue>) -> Vec<TransitionControl> {
@@ -904,7 +1944,17 @@ fn parse_transition_controls(value: Option<&PsbValue>) -> Vec<TransitionControl>
         .collect()
 }
 
-fn parse_physics_controls(value: Option<&PsbValue>, bust: bool) -> Vec<PhysicsControl> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicsControlKind {
+    Bust,
+    Hair,
+    Parts,
+}
+
+fn parse_physics_controls(
+    value: Option<&PsbValue>,
+    kind: PhysicsControlKind,
+) -> Vec<PhysicsControl> {
     value
         .and_then(PsbValue::as_list)
         .unwrap_or(&[])
@@ -920,10 +1970,10 @@ fn parse_physics_controls(value: Option<&PsbValue>, bust: bool) -> Vec<PhysicsCo
                 var_lrm: control.field_str("var_lrm").map(str::to_owned),
                 fields: object_to_map(control)?,
             };
-            Some(if bust {
-                PhysicsControl::Bust(definition)
-            } else {
-                PhysicsControl::Hair(definition)
+            Some(match kind {
+                PhysicsControlKind::Bust => PhysicsControl::Bust(definition),
+                PhysicsControlKind::Hair => PhysicsControl::Hair(definition),
+                PhysicsControlKind::Parts => PhysicsControl::Parts(definition),
             })
         })
         .collect()
@@ -950,52 +2000,69 @@ fn object_to_map(value: &PsbValue) -> Option<BTreeMap<String, PsbValue>> {
 
 /// Initialize bust physics states from the pipeline's bust controls.
 /// Initial bob position from param.p, velocity from param.pv.
-/// ofs (equilibrium displacement) = -(param.ofs): when bob.y = anchor.y + param.ofs
-/// (screen Y-down), displacement.y = -param.ofs = ofs, so var_ud = 0 at rest.
+/// param.op and param.p are stored in the baseLayer-local coordinate system.
+/// The first physics tick translates the saved bob into world space using the
+/// current baseLayer marker.
 fn init_bust_states(pipeline: &EmoteRuntimePipeline) -> Vec<BustPhysicsState> {
     let mut out = Vec::new();
     for control in &pipeline.physics_controls {
-        let PhysicsControl::Bust(def) = control else { continue };
+        let PhysicsControl::Bust(def) = control else {
+            continue;
+        };
         let param = def.fields.get("param");
-        let p = parse_vec3_field(param, "p");
-        let pv = parse_vec3_field(param, "pv");
+        let bob = parse_vec3_field(param, "p");
+        let root_offset = parse_vec3_field(param, "op");
+        let vel = parse_vec3_field(param, "pv");
         let param_ofs = param.and_then(|v| v.field_f32("ofs")).unwrap_or(0.0);
         out.push(BustPhysicsState {
-            bob: p,
-            vel: pv,
-            ofs: -param_ofs,
+            bob,
+            vel,
+            ofs: param_ofs,
             first_tick: true,
-            anchor_offset: [0.0, 0.0],
+            root_offset,
+            last_anchor: None,
         });
     }
     out
 }
 
-/// Initialize hair physics states from the pipeline's hair controls.
+/// Initialize pendulum states from the original constructor semantics.
+///
+/// EPPendControl does not initialize its bobs from param.p/pv in the PSB path.
+/// The constructor creates rest0 = root + length[0] * (0, 1, 0) and
+/// rest1 = rest0 + length[1] * (0, 1, 0), then copies those rest points into
+/// the two current bobs and zeroes both velocities.
 fn init_hair_states(pipeline: &EmoteRuntimePipeline) -> Vec<HairPhysicsState> {
     let mut out = Vec::new();
     for control in &pipeline.physics_controls {
-        let PhysicsControl::Hair(def) = control else { continue };
+        let def = match control {
+            PhysicsControl::Hair(def) | PhysicsControl::Parts(def) => def,
+            _ => continue,
+        };
+        let lengths = physics_field_f32_list_2(def, "length");
+        let root = [0.0, 0.0, 0.0];
+        let rest0 = [root[0], root[1] + lengths[0], root[2]];
+        let rest1 = [rest0[0], rest0[1] + lengths[1], rest0[2]];
         let param = def.fields.get("param");
-        // p is a list of 2 vec3s for the 2 segments
-        let p0 = parse_vec3_from_list(param, "p", 0);
-        let p1 = parse_vec3_from_list(param, "p", 1);
-        let pv0 = parse_vec3_from_list(param, "pv", 0);
-        let pv1 = parse_vec3_from_list(param, "pv", 1);
         let param_ofs = param.and_then(|v| v.field_f32("ofs")).unwrap_or(0.0);
         out.push(HairPhysicsState {
-            bob: [p0, p1],
-            vel: [pv0, pv1],
+            bob: [rest0, rest1],
+            vel: [[0.0; 3], [0.0; 3]],
             ofs: param_ofs,
             first_tick: true,
-            anchor_offset: [0.0, 0.0],
+            root_offset: [0.0, 0.0, 0.0],
+            last_anchor: None,
+            bend_phase: 0.0,
+            bend_power: 0.0,
         });
     }
     out
 }
 
 fn parse_vec3_field(parent: Option<&PsbValue>, key: &str) -> [f32; 3] {
-    let Some(v) = parent.and_then(|p| p.field(key)) else { return [0.0; 3] };
+    let Some(v) = parent.and_then(|p| p.field(key)) else {
+        return [0.0; 3];
+    };
     [
         v.field_f32("x").unwrap_or(0.0),
         v.field_f32("y").unwrap_or(0.0),
@@ -1003,17 +2070,10 @@ fn parse_vec3_field(parent: Option<&PsbValue>, key: &str) -> [f32; 3] {
     ]
 }
 
-fn parse_vec3_from_list(parent: Option<&PsbValue>, key: &str, index: usize) -> [f32; 3] {
-    let Some(list) = parent.and_then(|p| p.field(key)).and_then(PsbValue::as_list) else { return [0.0; 3] };
-    let Some(item) = list.get(index) else { return [0.0; 3] };
-    [
-        item.field_f32("x").unwrap_or(0.0),
-        item.field_f32("y").unwrap_or(0.0),
-        item.field_f32("z").unwrap_or(0.0),
-    ]
-}
-
-fn evaluate_selector_control(control: &SelectorControl, variables: &mut BTreeMap<String, EmoteVariableState>) {
+fn evaluate_selector_control(
+    control: &SelectorControl,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
     if !control.enabled {
         return;
     }
@@ -1031,14 +2091,26 @@ fn evaluate_selector_control(control: &SelectorControl, variables: &mut BTreeMap
     }
 }
 
-fn evaluate_clamp_control(control: &ClampControl, variables: &mut BTreeMap<String, EmoteVariableState>) {
+fn evaluate_clamp_control(
+    control: &ClampControl,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
     if !control.enabled {
         return;
     }
-    let lr = variables.get(&control.var_lr).map(|state| state.value).unwrap_or(0.0);
-    let ud = variables.get(&control.var_ud).map(|state| state.value).unwrap_or(0.0);
+    let lr = variables
+        .get(&control.var_lr)
+        .map(|state| state.value)
+        .unwrap_or(0.0);
+    let ud = variables
+        .get(&control.var_ud)
+        .map(|state| state.value)
+        .unwrap_or(0.0);
     let (next_lr, next_ud) = if control.kind == 0 {
-        (lr.clamp(control.min, control.max), ud.clamp(control.min, control.max))
+        (
+            lr.clamp(control.min, control.max),
+            ud.clamp(control.min, control.max),
+        )
     } else {
         let radius = lr.hypot(ud);
         let max_radius = control.max.abs().max(f32::EPSILON);
@@ -1053,97 +2125,172 @@ fn evaluate_clamp_control(control: &ClampControl, variables: &mut BTreeMap<Strin
     set_evaluated_variable(variables, &control.var_ud, next_ud);
 }
 
-fn evaluate_loop_control(control: &LoopControl, _variables: &mut BTreeMap<String, EmoteVariableState>) {
-    if control.enabled && control.var_loop.is_some() {
-        #[cfg(debug_assertions)]
-        if !LOOP_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
-            eprintln!("loopControl is parsed; transition semantics are not confirmed");
+fn evaluate_loop_control(
+    control: &LoopControl,
+    elapsed_ticks: f32,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
+    if !control.enabled {
+        return;
+    }
+    let Some(var_loop) = control.var_loop.as_deref() else {
+        return;
+    };
+    let total: f32 = control
+        .transition_list
+        .iter()
+        .map(|item| item.duration_ticks.max(0.0))
+        .sum();
+    if total <= f32::EPSILON {
+        return;
+    }
+    let mut t = elapsed_ticks.rem_euclid(total);
+    for item in &control.transition_list {
+        let duration = item.duration_ticks.max(0.0);
+        if t <= duration || duration <= f32::EPSILON {
+            let ratio = if duration <= f32::EPSILON {
+                1.0
+            } else {
+                (t / duration).clamp(0.0, 1.0)
+            };
+            set_evaluated_variable(
+                variables,
+                var_loop,
+                item.start + (item.end - item.start) * ratio,
+            );
+            return;
         }
+        t -= duration;
     }
 }
 
-fn evaluate_mirror_control(control: &MirrorControl, _variables: &mut BTreeMap<String, EmoteVariableState>) {
-    if !control.variable_match_list.is_empty() {
-        #[cfg(debug_assertions)]
-        if !MIRROR_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
-            eprintln!("mirrorControl variableMatchList is parsed; mirror application semantics are not confirmed");
-        }
+fn evaluate_mirror_control(
+    control: &MirrorControl,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
+    if control.variable_match_list.is_empty() {
+        return;
     }
-}
-
-fn evaluate_transition_control(_control: &TransitionControl, _variables: &mut BTreeMap<String, EmoteVariableState>) {}
-
-fn evaluate_opaque_controls(name: &str, controls: &[OpaqueControl]) {
+    // The original mirrorControl stores variable match/copy entries. In the PSB
+    // text form currently parsed here we may only have flattened labels, so keep
+    // the evaluator non-destructive instead of guessing source/target pairing.
     #[cfg(debug_assertions)]
-    if !controls.is_empty() && !OPAQUE_CONTROL_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
-        let labels: Vec<&str> = controls.iter().filter_map(|control| control.label.as_deref()).take(8).collect();
-        eprintln!("{name} is parsed and ticked through runtime; original side-effect semantics are not fully confirmed: labels={labels:?}");
+    if !MIRROR_WARNING_PRINTED.swap(true, Ordering::Relaxed) {
+        eprintln!("mirrorControl variableMatchList parsed; exact source/target pair layout still needs model-specific decoding: {} entries", control.variable_match_list.len());
     }
-    #[cfg(not(debug_assertions))]
-    let _ = (name, controls);
+    let _ = variables;
 }
 
-/// EPBustControl spring integration per tick.
-/// Algorithm confirmed from sub_101D4300 decompilation (docs/emote.sqlite).
-/// anchor = world position of baseLayer (we use 0,0 since we don't track it per-frame).
-/// Screen Y-down coordinates: gravity direction = (0, +1, 0).
-/// Equilibrium: spring * ofs_dist = gravity → ofs_dist = gravity / spring.
+fn evaluate_transition_control(
+    _control: &TransitionControl,
+    _variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
+}
+
+/// EPBustControl group update.
+///
+/// This follows sub_10273DA0: the baseLayer target is interpolated from the
+/// previous frame to the current frame and EPBustControl::step is called over
+/// fixed substeps.  The first frame only initializes the root offset.
 fn step_bust_physics(
     state: &mut BustPhysicsState,
     def: &PhysicsControlDefinition,
     delta_ticks: f32,
+    target_anchor: [f32; 3],
+    angle_radians: f32,
+    outer_force: [f32; 2],
+    output_scale: f32,
     variables: &mut BTreeMap<String, EmoteVariableState>,
 ) {
-    if !def.enabled || delta_ticks <= 0.0 {
+    if !def.enabled {
         return;
     }
-    let dt = delta_ticks;
-    let gravity = def.fields.get("gravity").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let spring = def.fields.get("spring").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let friction = def.fields.get("friction").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let scale_x = def.fields.get("scale_x").and_then(|v| v.as_f32()).unwrap_or(1.0);
-    let scale_y = def.fields.get("scale_y").and_then(|v| v.as_f32()).unwrap_or(1.0);
+    if state.first_tick {
+        state.bob = [
+            target_anchor[0] + state.bob[0],
+            target_anchor[1] + state.bob[1],
+            target_anchor[2] + state.bob[2],
+        ];
+        state.last_anchor = Some(target_anchor);
+        state.first_tick = false;
+        step_bust_physics_once(
+            state,
+            def,
+            0.0,
+            target_anchor,
+            angle_radians,
+            outer_force,
+            output_scale,
+            variables,
+        );
+        return;
+    }
+    if delta_ticks <= PHYSICS_EPSILON_TICKS {
+        return;
+    }
+    let previous_anchor = state.last_anchor.unwrap_or(target_anchor);
+    let mut elapsed = 0.0;
+    while (delta_ticks - PHYSICS_EPSILON_TICKS) > elapsed {
+        let step = (delta_ticks - elapsed).min(PHYSICS_MAX_SUBSTEP_TICKS);
+        elapsed += step;
+        let ratio = (elapsed / delta_ticks).clamp(0.0, 1.0);
+        let anchor = lerp_vec3(previous_anchor, target_anchor, ratio);
+        step_bust_physics_once(
+            state,
+            def,
+            step,
+            anchor,
+            angle_radians,
+            outer_force,
+            output_scale,
+            variables,
+        );
+    }
+    state.last_anchor = Some(target_anchor);
+}
 
-    // anchor = world position of baseLayer. We don't track per-layer world positions
-    // in ElunaPlayer, so we use (0,0,0). This is correct for a stationary idle pose.
-    let anchor = [0.0f32, 0.0, 0.0];
+fn step_bust_physics_once(
+    state: &mut BustPhysicsState,
+    def: &PhysicsControlDefinition,
+    dt: f32,
+    target_anchor: [f32; 3],
+    angle_radians: f32,
+    outer_force: [f32; 2],
+    output_scale: f32,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
+    let gravity = physics_field_f32(def, "gravity", 0.0);
+    let spring = physics_field_f32(def, "spring", 0.0);
+    let friction = physics_field_f32(def, "friction", 0.0);
+    let scale_x = physics_field_f32(def, "scale_x", 1.0) * output_scale;
+    let scale_y = physics_field_f32(def, "scale_y", 1.0) * output_scale;
 
-    // displacement = anchor - bob (spring restoring vector)
-    let disp = [
-        anchor[0] - state.bob[0],
-        anchor[1] - state.bob[1],
-        anchor[2] - state.bob[2],
+    let root = [
+        target_anchor[0] + state.root_offset[0],
+        target_anchor[1] + state.root_offset[1],
+        target_anchor[2] + state.root_offset[2],
     ];
 
-    // gravity direction in screen Y-down coords: (0, +1, 0)
-    // Confirmed: at rest with bob.y = ofs_dist below anchor, spring * ofs_dist = gravity.
-    let grav_x = 0.0f32;
-    let grav_y = 1.0f32;
+    let down = rotated_down(angle_radians);
+    let disp = sub_vec3(root, state.bob);
 
-    // vel += (spring * disp + gravity * grav_dir) * dt
-    state.vel[0] += (spring * disp[0] + gravity * grav_x) * dt;
-    state.vel[1] += (spring * disp[1] + gravity * grav_y) * dt;
-    state.vel[2] += (spring * disp[2]) * dt;
+    state.vel[0] += (spring * disp[0] + gravity * down[0] + outer_force[0]) * dt;
+    state.vel[1] += (spring * disp[1] + gravity * down[1] + outer_force[1]) * dt;
+    state.vel[2] += spring * disp[2] * dt;
 
-    // vel *= (1 - friction * dt)
-    let damp = 1.0 - friction * dt;
+    let damp = (1.0 - friction * dt).max(0.0);
     state.vel[0] *= damp;
     state.vel[1] *= damp;
     state.vel[2] *= damp;
 
-    // bob += vel * dt
     state.bob[0] += state.vel[0] * dt;
     state.bob[1] += state.vel[1] * dt;
     state.bob[2] += state.vel[2] * dt;
 
-    // output displacement = anchor - bob (updated)
-    let out_disp_x = anchor[0] - state.bob[0];
-    let out_disp_y = anchor[1] - state.bob[1];
-
-    // var_lr = -out_disp.x * scale_x
-    // var_ud = -(out_disp.y - ofs) * scale_y  (ofs = equilibrium displacement.y)
-    let var_lr = -out_disp_x * scale_x;
-    let var_ud = -(out_disp_y - state.ofs) * scale_y;
+    let out_disp = sub_vec3(root, state.bob);
+    let mut var_lr = -out_disp[0] * scale_x;
+    let mut var_ud = (out_disp[1] + state.ofs) * scale_y;
+    deadzone_pair(&mut var_lr, &mut var_ud);
 
     if let Some(name) = &def.var_lr {
         set_evaluated_variable(variables, name, var_lr);
@@ -1153,127 +2300,301 @@ fn step_bust_physics(
     }
 }
 
-/// EPPendControl two-segment pendulum per tick.
-/// Algorithm confirmed from sub_10201AB0 decompilation (docs/emote.sqlite).
-/// Each segment is a length-constrained pendulum with gravity and per-axis friction.
+/// EPPendControl group update for hairControl and partsControl.
+///
+/// This follows sub_10274A80: interpolate the baseLayer target over fixed
+/// substeps, call EPPendControl::step, then apply the bend post-process.
 fn step_hair_physics(
     state: &mut HairPhysicsState,
     def: &PhysicsControlDefinition,
     delta_ticks: f32,
+    target_anchor: [f32; 3],
+    angle_radians: f32,
+    outer_force: [f32; 2],
+    output_scale: f32,
     variables: &mut BTreeMap<String, EmoteVariableState>,
 ) {
-    if !def.enabled || delta_ticks <= 0.0 {
+    if !def.enabled {
         return;
     }
-    let dt = delta_ticks;
-    let gravity = def.fields.get("gravity").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let friction_x = def.fields.get("friction_x").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let friction_y = def.fields.get("friction_y").and_then(|v| v.as_f32()).unwrap_or(0.0);
-    let lengths = parse_f32_list_2(&def.fields, "length");
-    let scale_x = parse_f32_list_2(&def.fields, "scale_x");
-    let scale_y = parse_f32_list_2(&def.fields, "scale_y");
-    let ud_eft = def.fields.get("ud_eft").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+    if state.first_tick {
+        let lengths = physics_field_f32_list_2(def, "length");
+        let root = [
+            target_anchor[0] + state.root_offset[0],
+            target_anchor[1] + state.root_offset[1],
+            target_anchor[2] + state.root_offset[2],
+        ];
+        let rest0 = [root[0], root[1] + lengths[0], root[2]];
+        let rest1 = [rest0[0], rest0[1] + lengths[1], rest0[2]];
+        state.root_offset = [
+            root[0] - target_anchor[0],
+            root[1] - target_anchor[1],
+            root[2] - target_anchor[2],
+        ];
+        state.bob = [rest0, rest1];
+        state.vel = [[0.0; 3], [0.0; 3]];
+        state.last_anchor = Some(target_anchor);
+        state.first_tick = false;
+        step_hair_physics_once(
+            state,
+            def,
+            0.0,
+            target_anchor,
+            angle_radians,
+            outer_force,
+            output_scale,
+            variables,
+        );
+        return;
+    }
+    if delta_ticks <= PHYSICS_EPSILON_TICKS {
+        return;
+    }
+    let previous_anchor = state.last_anchor.unwrap_or(target_anchor);
+    let mut elapsed = 0.0;
+    while (delta_ticks - PHYSICS_EPSILON_TICKS) > elapsed {
+        let step = (delta_ticks - elapsed).min(PHYSICS_MAX_SUBSTEP_TICKS);
+        elapsed += step;
+        let ratio = (elapsed / delta_ticks).clamp(0.0, 1.0);
+        let anchor = lerp_vec3(previous_anchor, target_anchor, ratio);
+        step_hair_physics_once(
+            state,
+            def,
+            step,
+            anchor,
+            angle_radians,
+            outer_force,
+            output_scale,
+            variables,
+        );
+    }
+    state.last_anchor = Some(target_anchor);
+}
 
-    // Hinge positions: seg0 hinge = anchor, seg1 hinge = seg0 bob
-    let anchor = [0.0f32, 0.0, 0.0];
+fn step_hair_physics_once(
+    state: &mut HairPhysicsState,
+    def: &PhysicsControlDefinition,
+    dt: f32,
+    target_anchor: [f32; 3],
+    angle_radians: f32,
+    outer_force: [f32; 2],
+    output_scale: f32,
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+) {
+    let gravity = physics_field_f32(def, "gravity", 0.0);
+    let friction_x = physics_field_f32(def, "friction_x", 0.0);
+    let friction_y = physics_field_f32(def, "friction_y", 0.0);
+    let b_rate = physics_field_f32(def, "b_rate", 0.0);
+    let v_bound = physics_field_f32(def, "v_bound", 0.0);
+    let bend_spd = physics_field_f32(def, "bend_spd", 0.0);
+    let bend_vol = physics_field_f32(def, "bend_vol", 0.0);
+    let lengths = physics_field_f32_list_2(def, "length");
+    let scale_x = physics_field_f32_list_2(def, "scale_x");
+    let scale_y = physics_field_f32_list_2(def, "scale_y");
+    let ud_eft = physics_field_i64(def, "ud_eft", 0).clamp(0, 1) as usize;
+
+    let root = [
+        target_anchor[0] + state.root_offset[0],
+        target_anchor[1] + state.root_offset[1],
+        target_anchor[2] + state.root_offset[2],
+    ];
+    let rest0 = [root[0], root[1] + lengths[0], root[2]];
+    let rest1 = [rest0[0], rest0[1] + lengths[1], rest0[2]];
+    let rest = [rest0, rest1];
+    let down = rotated_down(angle_radians);
+    let gravity_vec = [
+        down[0] * gravity + outer_force[0],
+        down[1] * gravity + outer_force[1],
+        0.0,
+    ];
 
     for j in 0..2 {
-        // Step 1: gravity (+Y = down in screen coords)
-        state.vel[j][1] += gravity * dt;
+        let hinge = if j == 0 { root } else { state.bob[0] };
+        let hinge_to_bob = sub_vec3(state.bob[j], hinge);
+        let dist = vec3_len(hinge_to_bob);
+        let seg_len = lengths[j].max(f32::EPSILON);
+        if dist > seg_len && dist > f32::EPSILON {
+            let outward = scale_vec3(hinge_to_bob, 1.0 / dist);
+            let inward = scale_vec3(outward, -1.0);
+            let excess = dist - seg_len;
+            if excess > 0.015625 {
+                if j == 1 {
+                    state.bob[j] = add_vec3(state.bob[j], scale_vec3(inward, excess));
+                    let radial_velocity = dot_vec3(state.vel[j], inward);
+                    state.vel[j] = add_vec3(
+                        state.vel[j],
+                        scale_vec3(inward, -radial_velocity * v_bound * dt),
+                    );
+                } else {
+                    state.vel[j] = add_vec3(state.vel[j], scale_vec3(inward, excess * b_rate * dt));
+                }
+            }
+        }
 
-        // Step 2: per-axis friction
+        state.vel[j][0] += gravity_vec[0] * dt;
+        state.vel[j][1] += gravity_vec[1] * dt;
+        state.vel[j][2] += gravity_vec[2] * dt;
+
         state.vel[j][0] -= state.vel[j][0] * friction_x * dt;
         state.vel[j][1] -= state.vel[j][1] * friction_y * dt;
         state.vel[j][2] -= state.vel[j][2] * friction_y * dt;
 
-        // Step 3: integrate
-        state.bob[j][0] += state.vel[j][0] * dt;
-        state.bob[j][1] += state.vel[j][1] * dt;
-        state.bob[j][2] += state.vel[j][2] * dt;
+        state.bob[j] = add_vec3(state.bob[j], scale_vec3(state.vel[j], dt));
+    }
 
-        // Step 4: inextensible length constraint — correct position then project out
-        // the radial velocity component (velocity along hinge→bob direction).
-        // Without velocity projection gravity accumulates unbounded outward speed.
-        let hinge_now = if j == 0 { anchor } else { state.bob[0] };
-        let diff = [
-            state.bob[j][0] - hinge_now[0],
-            state.bob[j][1] - hinge_now[1],
-            state.bob[j][2] - hinge_now[2],
-        ];
-        let dist = (diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2]).sqrt();
-        let seg_len = lengths[j];
-        if dist > seg_len && dist > f32::EPSILON {
-            let scale = seg_len / dist;
-            state.bob[j][0] = hinge_now[0] + diff[0] * scale;
-            state.bob[j][1] = hinge_now[1] + diff[1] * scale;
-            state.bob[j][2] = hinge_now[2] + diff[2] * scale;
-            // Remove velocity component pointing outward (away from hinge)
-            let dir = [diff[0]/dist, diff[1]/dist, diff[2]/dist];
-            let radial_vel = state.vel[j][0]*dir[0] + state.vel[j][1]*dir[1] + state.vel[j][2]*dir[2];
-            if radial_vel > 0.0 {
-                state.vel[j][0] -= radial_vel * dir[0];
-                state.vel[j][1] -= radial_vel * dir[1];
-                state.vel[j][2] -= radial_vel * dir[2];
-            }
-        }
+    let d0 = sub_vec3(rest[0], state.bob[0]);
+    let d1 = sub_vec3(rest[1], state.bob[1]);
+    let mut var_lr = -d0[0] * scale_x[0] * output_scale;
+    let mut var_lrm = -d1[0] * scale_x[1] * output_scale;
+    let ud_disp = if ud_eft == 0 { d0[1] } else { d1[1] };
+    let mut var_ud = (state.ofs - ud_disp) * scale_y[ud_eft] * output_scale;
 
-        // Output displacement (hinge - bob, as in EPBustControl convention)
-        let hinge_final = if j == 0 { anchor } else { state.bob[0] };
-        let disp_out = [
-            hinge_final[0] - state.bob[j][0],
-            hinge_final[1] - state.bob[j][1],
-            hinge_final[2] - state.bob[j][2],
-        ];
+    apply_pend_bend(state, bend_spd, bend_vol, dt, &mut var_lr, &mut var_lrm);
+    deadzone_triple(&mut var_lr, &mut var_lrm, &mut var_ud);
 
-        // var_lr (j==0) and var_lrm (j==1): x-displacement * scale_x[j]
-        let var_val = -disp_out[0] * scale_x[j];
-        if j == 0 {
-            if let Some(name) = &def.var_lr {
-                set_evaluated_variable(variables, name, var_val);
-            }
-        } else if let Some(name) = &def.var_lrm {
-            set_evaluated_variable(variables, name, var_val);
-        }
-
-        // var_ud: from the segment indicated by ud_eft
-        if j == ud_eft {
-            let var_ud = (state.ofs - disp_out[1]) * scale_y[j];
-            if let Some(name) = &def.var_ud {
-                set_evaluated_variable(variables, name, var_ud);
-            }
-        }
+    if let Some(name) = &def.var_lr {
+        set_evaluated_variable(variables, name, var_lr);
+    }
+    if let Some(name) = &def.var_lrm {
+        set_evaluated_variable(variables, name, var_lrm);
+    }
+    if let Some(name) = &def.var_ud {
+        set_evaluated_variable(variables, name, var_ud);
     }
 }
 
-fn parse_f32_list_2(fields: &BTreeMap<String, PsbValue>, key: &str) -> [f32; 2] {
-    let Some(val) = fields.get(key) else { return [0.0; 2]; };
-    match val {
+fn apply_pend_bend(
+    state: &mut HairPhysicsState,
+    bend_spd: f32,
+    bend_vol: f32,
+    dt: f32,
+    var_lr: &mut f32,
+    var_lrm: &mut f32,
+) {
+    if bend_spd == 0.0 || bend_vol == 0.0 {
+        return;
+    }
+    let trigger = var_lr.abs();
+    if trigger <= PEND_BEND_TRIGGER_VALUE {
+        state.bend_power = (state.bend_power - PEND_BEND_POWER_STEP * dt).max(0.0);
+    } else {
+        state.bend_power = (state.bend_power + PEND_BEND_POWER_STEP * dt).min(1.0);
+    }
+    state.bend_phase = (state.bend_phase + bend_spd * state.bend_power * dt).rem_euclid(TAU);
+    let bend = state.bend_phase.sin() * state.bend_power * bend_vol;
+    *var_lrm += bend;
+    *var_lr -= bend;
+}
+
+fn rotated_down(angle_radians: f32) -> [f32; 3] {
+    let c = (-angle_radians).cos();
+    let s = (-angle_radians).sin();
+    [-s, c, 0.0]
+}
+
+fn lerp_vec3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+fn add_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn sub_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn scale_vec3(a: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn dot_vec3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn vec3_len(a: [f32; 3]) -> f32 {
+    dot_vec3(a, a).sqrt()
+}
+
+fn deadzone_pair(a: &mut f32, b: &mut f32) {
+    if a.abs() <= 0.01 && b.abs() <= 0.01 {
+        *a = 0.0;
+        *b = 0.0;
+    }
+}
+
+fn deadzone_triple(a: &mut f32, b: &mut f32, c: &mut f32) {
+    if a.abs() <= 0.01 && b.abs() <= 0.01 && c.abs() <= 0.01 {
+        *a = 0.0;
+        *b = 0.0;
+        *c = 0.0;
+    }
+}
+
+fn physics_field_f32(def: &PhysicsControlDefinition, key: &str, default: f32) -> f32 {
+    def.fields
+        .get("param")
+        .and_then(|param| param.field_f32(key))
+        .or_else(|| def.fields.get(key).and_then(PsbValue::as_f32))
+        .unwrap_or(default)
+}
+
+fn physics_field_i64(def: &PhysicsControlDefinition, key: &str, default: i64) -> i64 {
+    def.fields
+        .get("param")
+        .and_then(|param| param.field_i64(key))
+        .or_else(|| def.fields.get(key).and_then(PsbValue::as_i64))
+        .unwrap_or(default)
+}
+
+fn physics_field_f32_list_2(def: &PhysicsControlDefinition, key: &str) -> [f32; 2] {
+    if let Some(param) = def.fields.get("param") {
+        let parsed = parse_f32_value_list_2(param.field(key));
+        if parsed != [0.0, 0.0] {
+            return parsed;
+        }
+    }
+    parse_f32_value_list_2(def.fields.get(key))
+}
+
+fn parse_f32_value_list_2(value: Option<&PsbValue>) -> [f32; 2] {
+    let Some(value) = value else {
+        return [0.0, 0.0];
+    };
+    match value {
         PsbValue::List(items) => {
-            let a = items.first().and_then(|v| v.as_f32()).unwrap_or(0.0);
-            let b = items.get(1).and_then(|v| v.as_f32()).unwrap_or(0.0);
+            let a = items.first().and_then(PsbValue::as_f32).unwrap_or(0.0);
+            let b = items.get(1).and_then(PsbValue::as_f32).unwrap_or(a);
             [a, b]
         }
         _ => {
-            let v = val.as_f32().unwrap_or(0.0);
+            let v = value.as_f32().unwrap_or(0.0);
             [v, v]
         }
     }
 }
 
-fn set_evaluated_variable(variables: &mut BTreeMap<String, EmoteVariableState>, name: &str, value: f32) {
+fn set_evaluated_variable(
+    variables: &mut BTreeMap<String, EmoteVariableState>,
+    name: &str,
+    value: f32,
+) {
     if name.is_empty() || !value.is_finite() {
         return;
     }
-    let state = variables.entry(name.to_owned()).or_insert_with(|| EmoteVariableState {
-        info: EmoteVariableInfo {
-            name: name.to_owned(),
-            default_value: value,
-            min_value: None,
-            max_value: None,
-        },
-        value,
-        target: None,
-    });
+    let state = variables
+        .entry(name.to_owned())
+        .or_insert_with(|| EmoteVariableState {
+            info: EmoteVariableInfo {
+                name: name.to_owned(),
+                default_value: value,
+                min_value: None,
+                max_value: None,
+                frames: Vec::new(),
+            },
+            value,
+            target: None,
+        });
     state.value = clamp_variable_value(&state.info, value);
     state.target = None;
 }
@@ -1283,12 +2604,12 @@ pub fn collect_emote_timelines(psb: &PsbFile) -> Vec<EmoteTimeline> {
     let aliases = collect_variable_frame_aliases(psb);
     if let Some(metadata) = psb.root.field("metadata") {
         if let Some(timeline_root) = metadata.field("timelineControl") {
-            collect_timeline_nodes(timeline_root, "", &aliases, &mut out);
+            collect_timeline_nodes(timeline_root, "", false, &aliases, &mut out);
         }
         for key in CONTROL_METADATA_KEYS {
             if let Some(control_root) = metadata.field(key) {
                 let path = format!("@control/{key}");
-                collect_timeline_nodes(control_root, &path, &aliases, &mut out);
+                collect_timeline_nodes(control_root, &path, false, &aliases, &mut out);
             }
         }
     }
@@ -1301,6 +2622,7 @@ pub fn collect_emote_timelines(psb: &PsbFile) -> Vec<EmoteTimeline> {
 fn collect_timeline_nodes(
     value: &PsbValue,
     path: &str,
+    inherited_difference: bool,
     aliases: &BTreeMap<String, BTreeMap<String, f32>>,
     out: &mut Vec<EmoteTimeline>,
 ) {
@@ -1308,7 +2630,7 @@ fn collect_timeline_nodes(
         PsbValue::List(items) => {
             for (index, item) in items.iter().enumerate() {
                 let next_path = join_timeline_path(path, &index.to_string());
-                collect_timeline_nodes(item, &next_path, aliases, out);
+                collect_timeline_nodes(item, &next_path, inherited_difference, aliases, out);
             }
         }
         PsbValue::Object(fields) => {
@@ -1316,7 +2638,13 @@ fn collect_timeline_nodes(
                 let label = value.field_str("label").unwrap_or("");
                 let folder_path = join_timeline_path(path, label);
                 if let Some(children) = value.field("children") {
-                    collect_timeline_nodes(children, &folder_path, aliases, out);
+                    collect_timeline_nodes(
+                        children,
+                        &folder_path,
+                        psb_field_bool_like(value, "diff").unwrap_or(inherited_difference),
+                        aliases,
+                        out,
+                    );
                 }
                 return;
             }
@@ -1331,8 +2659,14 @@ fn collect_timeline_nodes(
                     .field_str("path_hint")
                     .or_else(|| value.field_str("hint_path"))
                     .map(str::to_owned);
-                let full_name = hinted_path.clone().unwrap_or_else(|| join_timeline_path(path, label));
-                let name = if full_name.is_empty() { label.to_owned() } else { full_name };
+                let full_name = hinted_path
+                    .clone()
+                    .unwrap_or_else(|| join_timeline_path(path, label));
+                let name = if full_name.is_empty() {
+                    label.to_owned()
+                } else {
+                    full_name
+                };
 
                 let mut variables = Vec::new();
                 let mut duration = value
@@ -1345,7 +2679,8 @@ fn collect_timeline_nodes(
                     let Some(var_name) = variable_object_name(variable) else {
                         continue;
                     };
-                    let Some(frame_list) = variable.field("frameList").and_then(PsbValue::as_list) else {
+                    let Some(frame_list) = variable.field("frameList").and_then(PsbValue::as_list)
+                    else {
                         continue;
                     };
                     let mut frames = Vec::new();
@@ -1354,8 +2689,12 @@ fn collect_timeline_nodes(
                         let Some(content) = frame.field("content") else {
                             continue;
                         };
-                        let value = timeline_content_value(&var_name, content, aliases).unwrap_or(0.0);
-                        let easing = content.field_f32("easing").or_else(|| frame.field_f32("easing")).unwrap_or(0.0);
+                        let value =
+                            timeline_content_value(&var_name, content, aliases).unwrap_or(0.0);
+                        let easing = content
+                            .field_f32("easing")
+                            .or_else(|| frame.field_f32("easing"))
+                            .unwrap_or(0.0);
                         if value.is_finite() {
                             duration = duration.max(time);
                             frames.push(EmoteTimelineFrame {
@@ -1380,12 +2719,17 @@ fn collect_timeline_nodes(
                         path: hinted_path,
                         duration_ticks: duration,
                         variables,
+                        is_difference: psb_field_bool_like(value, "diff")
+                            .unwrap_or(inherited_difference),
                     });
                 }
             }
 
             for (key, child) in fields {
-                if matches!(key.as_str(), "variableList" | "frameList" | "content" | "variable") {
+                if matches!(
+                    key.as_str(),
+                    "variableList" | "frameList" | "content" | "variable"
+                ) {
                     continue;
                 }
                 let label = child
@@ -1394,7 +2738,13 @@ fn collect_timeline_nodes(
                     .or_else(|| child.field_str("id"))
                     .unwrap_or(key);
                 let next_path = join_timeline_path(path, label);
-                collect_timeline_nodes(child, &next_path, aliases, out);
+                collect_timeline_nodes(
+                    child,
+                    &next_path,
+                    psb_field_bool_like(child, "diff").unwrap_or(inherited_difference),
+                    aliases,
+                    out,
+                );
             }
         }
         _ => {}
@@ -1415,14 +2765,22 @@ fn timeline_content_value(
                 if let Ok(n) = label.parse::<f32>() {
                     return Some(n);
                 }
-                if let Some(n) = aliases.get(variable_name).and_then(|map| map.get(label)).copied() {
+                if let Some(n) = aliases
+                    .get(variable_name)
+                    .and_then(|map| map.get(label))
+                    .copied()
+                {
                     return Some(n);
                 }
             }
         }
     }
     if let Some(label) = content.field_str("label") {
-        if let Some(n) = aliases.get(variable_name).and_then(|map| map.get(label)).copied() {
+        if let Some(n) = aliases
+            .get(variable_name)
+            .and_then(|map| map.get(label))
+            .copied()
+        {
             return Some(n);
         }
     }
@@ -1488,7 +2846,10 @@ fn collect_control_variable_aliases(
         }
         PsbValue::Object(fields) => {
             for (key, child) in fields {
-                if matches!(key.as_str(), "variableList" | "variables" | "variable" | "frameList" | "content") {
+                if matches!(
+                    key.as_str(),
+                    "variableList" | "variables" | "variable" | "frameList" | "content"
+                ) {
                     continue;
                 }
                 collect_control_variable_aliases(child, out);
@@ -1510,14 +2871,24 @@ fn collect_one_variable_frame_alias(
     };
     let map = out.entry(name).or_default();
     for frame in frame_list {
-        let label = frame
-            .field_str("label")
-            .or_else(|| frame.field("content").and_then(|content| content.field_str("label")));
+        let label = frame.field_str("label").or_else(|| {
+            frame
+                .field("content")
+                .and_then(|content| content.field_str("label"))
+        });
         let value = frame
             .field_f32("frame")
-            .or_else(|| frame.field("content").and_then(|content| content.field_f32("frame")))
+            .or_else(|| {
+                frame
+                    .field("content")
+                    .and_then(|content| content.field_f32("frame"))
+            })
             .or_else(|| frame.field_f32("value"))
-            .or_else(|| frame.field("content").and_then(|content| content.field_f32("value")));
+            .or_else(|| {
+                frame
+                    .field("content")
+                    .and_then(|content| content.field_f32("value"))
+            });
         if let (Some(label), Some(value)) = (label, value) {
             if !label.is_empty() && value.is_finite() {
                 map.insert(label.to_owned(), value);
@@ -1557,11 +2928,19 @@ pub fn collect_emote_variables(psb: &PsbFile) -> Vec<EmoteVariableInfo> {
     collect_variable_list(psb.root.field("parameters"), &mut out);
     collect_parameter_variables_recursive(&psb.root, &mut out);
     collect_mesh_combinator_variables(&psb.root, &mut out);
+    for timeline in collect_emote_timelines(psb) {
+        for variable in &timeline.variables {
+            merge_timeline_variable_info(variable, &mut out);
+        }
+    }
 
     out.into_values().collect()
 }
 
-fn collect_parameter_variables_recursive(value: &PsbValue, out: &mut BTreeMap<String, EmoteVariableInfo>) {
+fn collect_parameter_variables_recursive(
+    value: &PsbValue,
+    out: &mut BTreeMap<String, EmoteVariableInfo>,
+) {
     if let Some(parameter_list) = value.field("parameter") {
         collect_variable_list(Some(parameter_list), out);
     }
@@ -1599,7 +2978,10 @@ fn collect_control_variables(value: &PsbValue, out: &mut BTreeMap<String, EmoteV
         }
         PsbValue::Object(fields) => {
             for (key, child) in fields {
-                if matches!(key.as_str(), "variableList" | "variables" | "variable" | "frameList" | "content") {
+                if matches!(
+                    key.as_str(),
+                    "variableList" | "variables" | "variable" | "frameList" | "content"
+                ) {
                     continue;
                 }
                 collect_control_variables(child, out);
@@ -1609,7 +2991,10 @@ fn collect_control_variables(value: &PsbValue, out: &mut BTreeMap<String, EmoteV
     }
 }
 
-fn collect_mesh_combinator_variables(value: &PsbValue, out: &mut BTreeMap<String, EmoteVariableInfo>) {
+fn collect_mesh_combinator_variables(
+    value: &PsbValue,
+    out: &mut BTreeMap<String, EmoteVariableInfo>,
+) {
     if let Some(combinators) = value
         .field("meshCombinator")
         .and_then(|mesh_combinator| mesh_combinator.field("combinatorList"))
@@ -1661,24 +3046,164 @@ fn collect_one_variable(value: &PsbValue, out: &mut BTreeMap<String, EmoteVariab
     let Some(name) = variable_object_name(value) else {
         return;
     };
-    out.entry(name.clone()).or_insert_with(|| EmoteVariableInfo {
-        name,
+
+    let frames = variable_frame_infos(value);
+    let frame_min = frames.iter().map(|frame| frame.value).reduce(f32::min);
+    let frame_max = frames.iter().map(|frame| frame.value).reduce(f32::max);
+
+    let next = EmoteVariableInfo {
+        name: name.clone(),
         default_value: value
             .field_f32("default")
             .or_else(|| value.field_f32("defaultValue"))
             .or_else(|| value.field_f32("initial"))
             .or_else(|| value.field_f32("curValue"))
             .or_else(|| value.field_f32("value"))
+            .or_else(|| frames.first().map(|frame| frame.value))
             .unwrap_or(0.0),
         min_value: value
             .field_f32("min")
             .or_else(|| value.field_f32("minValue"))
-            .or_else(|| value.field_f32("rangeBegin")),
+            .or_else(|| value.field_f32("rangeBegin"))
+            .or(frame_min),
         max_value: value
             .field_f32("max")
             .or_else(|| value.field_f32("maxValue"))
-            .or_else(|| value.field_f32("rangeEnd")),
+            .or_else(|| value.field_f32("rangeEnd"))
+            .or(frame_max),
+        frames,
+    };
+
+    merge_variable_info(name, next, out);
+}
+
+fn merge_timeline_variable_info(
+    variable: &EmoteTimelineVariable,
+    out: &mut BTreeMap<String, EmoteVariableInfo>,
+) {
+    if variable.name.is_empty() {
+        return;
+    }
+    let mut frames = Vec::new();
+    for frame in &variable.frames {
+        frames.push(EmoteVariableFrameInfo {
+            label: format!("{:.3}", frame.time_ticks),
+            value: frame.value,
+        });
+    }
+    let frame_min = frames.iter().map(|frame| frame.value).reduce(f32::min);
+    let frame_max = frames.iter().map(|frame| frame.value).reduce(f32::max);
+    let default_value = variable
+        .frames
+        .first()
+        .map(|frame| frame.value)
+        .unwrap_or(0.0);
+    merge_variable_info(
+        variable.name.clone(),
+        EmoteVariableInfo {
+            name: variable.name.clone(),
+            default_value,
+            min_value: frame_min,
+            max_value: frame_max,
+            frames,
+        },
+        out,
+    );
+}
+
+fn merge_variable_info(
+    name: String,
+    next: EmoteVariableInfo,
+    out: &mut BTreeMap<String, EmoteVariableInfo>,
+) {
+    let entry = out.entry(name).or_insert_with(|| next.clone());
+    if entry.frames.is_empty() && !next.frames.is_empty() {
+        entry.default_value = next.default_value;
+    }
+    if let Some(min) = next.min_value {
+        merge_range_value(&mut entry.min_value, &mut entry.max_value, min);
+    }
+    if let Some(max) = next.max_value {
+        merge_range_value(&mut entry.min_value, &mut entry.max_value, max);
+    }
+    for frame in next.frames {
+        if !entry.frames.iter().any(|existing| {
+            existing.label == frame.label && (existing.value - frame.value).abs() <= f32::EPSILON
+        }) {
+            merge_range_value(&mut entry.min_value, &mut entry.max_value, frame.value);
+            entry.frames.push(frame);
+        }
+    }
+}
+
+fn variable_frame_infos(value: &PsbValue) -> Vec<EmoteVariableFrameInfo> {
+    let Some(frame_list) = value.field("frameList").and_then(PsbValue::as_list) else {
+        return Vec::new();
+    };
+    let mut frames = Vec::new();
+    for frame in frame_list {
+        let label = frame
+            .field_str("label")
+            .or_else(|| {
+                frame
+                    .field("content")
+                    .and_then(|content| content.field_str("label"))
+            })
+            .unwrap_or("");
+        let value = frame
+            .field_f32("frame")
+            .or_else(|| {
+                frame
+                    .field("content")
+                    .and_then(|content| content.field_f32("frame"))
+            })
+            .or_else(|| frame.field_f32("value"))
+            .or_else(|| {
+                frame
+                    .field("content")
+                    .and_then(|content| content.field_f32("value"))
+            });
+        if let Some(value) = value.filter(|v| v.is_finite()) {
+            frames.push(EmoteVariableFrameInfo {
+                label: label.to_owned(),
+                value,
+            });
+        }
+    }
+    frames.sort_by(|a, b| {
+        a.value
+            .total_cmp(&b.value)
+            .then_with(|| a.label.cmp(&b.label))
     });
+    frames.dedup_by(|a, b| a.label == b.label && (a.value - b.value).abs() <= f32::EPSILON);
+    frames
+}
+
+fn psb_field_bool_like(value: &PsbValue, name: &str) -> Option<bool> {
+    match value.field(name)? {
+        PsbValue::Bool(v) => Some(*v),
+        PsbValue::Int(v) => Some(*v != 0),
+        PsbValue::Float(v) => Some(*v != 0.0),
+        PsbValue::Double(v) => Some(*v != 0.0),
+        PsbValue::String(v) => match v.as_str() {
+            "true" | "TRUE" | "True" | "1" => Some(true),
+            "false" | "FALSE" | "False" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_api_log_entry(line: &str) -> Option<EmoteApiLogEntry> {
+    let mut parts = line.split('\t');
+    let command = parts.next()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(EmoteApiLogEntry::new(
+        command.to_owned(),
+        parts.map(str::to_owned).collect(),
+    ))
 }
 
 fn variable_object_name(obj: &PsbValue) -> Option<String> {

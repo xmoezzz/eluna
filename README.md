@@ -2,6 +2,8 @@
 
 `eluna` is an open-source Emote/PSB reverse-engineering and reimplementation work made with Rust.
 
+![Eluna](./images/screenshot.png)
+
 ### Workspace members:
 
 - `eluna`, the library crate.

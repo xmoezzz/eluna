@@ -698,15 +698,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "eluna"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "lz4_flex",
- "rand",
-]
-
-[[package]]
 name = "eluna_player"
 version = "0.1.0"
 dependencies = [
@@ -714,11 +705,20 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
- "eluna",
+ "eluna_rs",
  "image",
  "pollster",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eluna_rs"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "lz4_flex",
+ "rand",
 ]
 
 [[package]]
@@ -2253,7 +2253,7 @@ dependencies = [
 name = "psb_extract"
 version = "0.1.0"
 dependencies = [
- "eluna",
+ "eluna_rs",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@ use crate::api::{
 };
 use crate::{
     collect_emote_runtime_pipeline, collect_emote_timelines, collect_emote_variables, ElunaPlayer,
-    EmoteDrawFrameInfo, EmoteModelSchema, EmoteMotionInfo, EmoteRuntimePipeline, EmoteSceneBounds,
+    EmoteDrawFrameInfo, EmoteGroundCorrectionHook, EmoteModelSchema, EmoteMotionInfo, EmoteRuntimePipeline, EmoteSceneBounds,
     EmoteSchemaError, EmoteStaticScene, EmoteStaticSprite, EmoteTextureSource, PsbDecryptionKey,
     PsbError, PsbFile, PsbNormalizeOptions, PsbValue,
 };
@@ -238,34 +238,38 @@ pub struct EmoteRuntimeParityReport {
 pub fn emote_runtime_parity_report() -> EmoteRuntimeParityReport {
     EmoteRuntimeParityReport {
         confirmed: vec![
-            "PSB/MDF/LZ4/key normalization",
-            "metadata control loading order from MEmotePlayer::Init",
-            "texture resource and atlas/icon extraction",
-            "timelineControl variable track interpolation",
-            "drawFrameInfo draw-list carrier",
-            "official JS frame-count time unit and 100ms frame cap",
-            "official JS main/diff timeline play flags",
-            "official JS mask defaults and premultiplied final copy contract",
-            "dynamic per-frame scene/drawFrameInfo rebuild",
+            "PSB/MDF/LZ4/key normalization and texture atlas extraction",
+            "stateful timeline/control progression including type-0 HOLD and authored loops",
+            "native Timeline blend lifecycle: active-only SetTimelineBlendRatio, DIFFERENCE-only stepping, queue/replace rules, unclamped scalar output, idle-stop flag, seek preservation, replay reset, and FadeIn/FadeOut wrappers",
+            "native frame transformOrder and player transform-order position/physics halves",
+            "raw +612/+616/+620 versus post-MeshChain +120/+124/+128 coordinate split",
+            "specialized-pass ordering for Anchor/MeshChain/readyToDraw/Camera/type-7/Shape/nested/Model/Particle/Feedback",
+            "type-7 raw-coordinate bounds propagation and clipping",
+            "Shape point/circle/rect/quad transform semantics",
+            "joinTarget decoded-frame and type-4 emitter state transfer",
+            "persistent particle child-MMotionPlayer lifecycle, continuous emission, flyDirection branches, and entered-screen deletion",
+            "native tri-volume particle Z scaling as sqrt(abs(det(layer_2x2))) for non-uniform scale/shear/reflection",
+            "native stencil ancestry reconstruction, Inner EQUAL+INCR, Outer EQUAL+DECR, composite-mask source lists, and type-12 wipe parameters",
+            "Feedback decay math and previous-framebuffer sampling",
+            "Camera FOV/eye/target/rounded-offset state per root and nested MMotionPlayer scope; standard 2-D draw path proven not to consume the offset",
+            "stereovisionControl metadata hierarchy, exact per-screen affine variable projection, active-mirror XOR, screen-order reversal, and six-field stereovisionProfile extraction",
+            "Model type-6 local-time/direction output for direction modes 2/3/4",
+            "groundCorrection host callback boundary and corrected raw-position writeback",
+            "bm/bp/four-corner color/objTriPriority/screenBounds metadata retention",
+            "bp/objTriPriority absence from this DLL's standard 2-D DrawFrameInfo consumer path",
         ],
         partial: vec![
-            "selectorControl optionList/offValue/onValue variable output",
-            "clampControl var_lr/var_ud clamping",
-            "partsControl/eyeControl/eyebrowControl/mouthControl parsing and tick visibility diagnostics",
-            "meshCombinator/rawMeshList frame mesh patch application",
-            "stencilCompositeMaskLayerList and stencilType propagation into drawFrameInfo",
-            "renderer pass separation for mask-generation layers",
+            "native runtime frame-mesh path content.mesh.bp is recovered; exporter-side meshCombinator/rawMeshList compatibility schema remains corpus-dependent because this DLL does not name those fields",
+            "stereovision player-side screen images are recovered; physical multiview/display composition remains a host responsibility",
+            "Model player-side type-6 state is recovered; loading/rendering referenceModelFileList resources remains a host 3-D backend responsibility",
+            "type-12 wipe/stencil and type-10 Feedback GPU paths are implemented but still require representative GPU runtime validation",
+            "particle random range/call sites are recovered but the DLL's host-global RNG seed/state is not serialized; the portable trigger-byte reconstruction can still differ on host-forced dirty paths",
         ],
         missing: vec![
-            "original transitionControl fade/diff state machine",
-            "original loopControl transition scheduler",
-            "original mirrorControl variable/mesh mirror application",
-            "original bustControl/hairControl/partsControl physics integration",
-            "full MMotionPlayer::StepFrameMeshChain parent/child mesh chain",
-            "confirmed meshSyncChildMask bit semantics",
-            "confirmed joinTarget binding semantics",
-            "true alpha-mask/stencil/composite/filter wgpu passes",
             "binary-compatible IEmotePlayer/PEmotePlayer ABI",
+            "host-specific stereoscopic display compositor and 3-D model renderer",
+            "host geometry behavior when no groundCorrection callback is supplied",
+            "actual cargo/test/GPU validation in the current toolchain-less execution environment",
         ],
     }
 }
@@ -284,6 +288,7 @@ pub struct EmoteRuntime {
     zindex: i32,
     reset_motion_on_hide: Option<String>,
     diff_slots: [Option<String>; 6],
+    ground_correction_hook: Option<EmoteGroundCorrectionHook>,
 }
 
 impl EmoteRuntime {
@@ -304,7 +309,7 @@ impl EmoteRuntime {
             .or_else(|| schema.default_motion_name(&psb).ok().flatten());
         let variables = collect_emote_variables(&psb);
         let timelines = collect_emote_timelines(&psb);
-        let initial_values = initial_variable_values(&variables, &timelines);
+        let initial_values = initial_variable_values(&variables);
         let runtime_pipeline = collect_emote_runtime_pipeline(&psb);
         let scene = match active_motion.as_deref() {
             Some(motion) => schema.build_motion_scene_at_with_resources_and_variables(
@@ -331,15 +336,15 @@ impl EmoteRuntime {
                     .or_else(|| {
                         player
                             .timelines()
-                            .keys()
-                            .find(|name| !name.starts_with("@control/"))
-                            .cloned()
+                            .values()
+                            .find(|timeline| !timeline.is_difference)
+                            .map(|timeline| timeline.name.clone())
                     })
             }) {
                 if !player.timelines().contains_key(&name) {
                     return Err(EmoteRuntimeError::MissingTimeline(name));
                 }
-                player.play_timeline(&name, TimelinePlayMode::PARALLEL.with_looping(true));
+                player.play_timeline(&name, TimelinePlayMode::ONCE);
             }
         }
 
@@ -356,6 +361,7 @@ impl EmoteRuntime {
             zindex: 1,
             reset_motion_on_hide: Some("初期化".to_owned()),
             diff_slots: Default::default(),
+            ground_correction_hook: None,
         };
         runtime.rebuild_scene()?;
         Ok(runtime)
@@ -387,33 +393,54 @@ impl EmoteRuntime {
         let Some(motion) = self.active_motion.as_deref() else {
             return Ok(());
         };
-        let variables = self.variable_values();
+        // Preserve the complete pre-tick StepFrame snapshot across BOTH scene
+        // builds below. Native needs previous finalized XYZ for nested-motion
+        // dt=2 and persistent local frame values for serialized type-0 HOLD.
+        // The second rebuild only reflects physics variables at the same motion
+        // time and must not treat the first rebuild as a new native frame.
+        let previous_scene = self.player.scene().clone();
+        let variables = self.player.evaluated_variable_values();
         let scene = self
             .schema
-            .build_motion_scene_at_with_resources_and_variables(
+            .build_motion_scene_at_with_resources_variables_previous_scene_and_ground_hook(
                 &self.psb,
                 &self.normalized_data,
                 motion,
                 self.player.elapsed_ticks(),
                 &variables,
+                &previous_scene,
+                self.ground_correction_hook,
             )?;
         self.player.replace_scene(scene);
         if physics_delta_ticks > 0.0 && self.player.is_physics_enabled() {
             self.player
                 .evaluate_physics_for_current_scene(physics_delta_ticks);
-            let variables = self.variable_values();
+            let variables = self.player.evaluated_variable_values();
             let scene = self
                 .schema
-                .build_motion_scene_at_with_resources_and_variables(
+                .build_motion_scene_at_with_resources_variables_previous_scene_and_ground_hook(
                     &self.psb,
                     &self.normalized_data,
                     motion,
                     self.player.elapsed_ticks(),
                     &variables,
+                    &previous_scene,
+                    self.ground_correction_hook,
                 )?;
             self.player.replace_scene(scene);
         }
         Ok(())
+    }
+
+    /// Installs the host geometry callback used by native groundCorrection.
+    /// The DLL delegates this query outside MMotionPlayer as well; keeping it
+    /// injectable avoids hard-coding game-specific collision geometry here.
+    pub fn set_ground_correction_hook(
+        &mut self,
+        hook: Option<EmoteGroundCorrectionHook>,
+    ) -> Result<(), EmoteRuntimeError> {
+        self.ground_correction_hook = hook;
+        self.rebuild_scene()
     }
 
     pub fn configure_transform(
@@ -476,7 +503,7 @@ impl EmoteRuntime {
             if self.player.timelines().contains_key(&reset_motion) {
                 self.player.stop_timeline("");
                 self.player
-                    .play_timeline(&reset_motion, TimelinePlayMode::PARALLEL.with_looping(true));
+                    .play_timeline(&reset_motion, TimelinePlayMode::ONCE);
                 self.diff_slots = Default::default();
             }
         }
@@ -491,15 +518,13 @@ impl EmoteRuntime {
         match slot {
             None | Some(0) => {
                 if let Some(name) = motion {
-                    self.play_timeline(name, TimelinePlayMode::PARALLEL.with_looping(true))?;
+                    self.play_timeline(name, TimelinePlayMode::ONCE)?;
                 } else {
                     let active: Vec<String> = self
                         .player
                         .active_timelines()
                         .iter()
-                        .filter(|(name, mode)| {
-                            !name.starts_with("@control/") && !mode.is_difference()
-                        })
+                        .filter(|(_, mode)| !mode.is_difference())
                         .map(|(name, _)| name.clone())
                         .collect();
                     for name in active {
@@ -931,6 +956,117 @@ impl EmoteRuntime {
         &self.schema.textures
     }
 
+    pub fn stereovision_control(&self) -> Option<&crate::emote::EmoteStereovisionControl> {
+        self.schema.stereovision.as_ref()
+    }
+
+    pub fn stereovision_profile(&self) -> Option<&crate::emote::EmoteStereovisionProfile> {
+        self.schema.stereovision_profile.as_ref()
+    }
+
+    pub fn runtime_mirror_enabled(&self) -> bool {
+        self.player.runtime_mirror_enabled()
+    }
+
+    pub fn active_mirror_enabled(&self) -> bool {
+        self.player.active_mirror_enabled()
+    }
+
+    pub fn set_runtime_mirror_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), EmoteRuntimeError> {
+        self.player.set_runtime_mirror_enabled(enabled);
+        self.rebuild_scene()
+    }
+
+    pub fn stereovision_enabled(&self) -> bool {
+        self.player.stereovision_enabled()
+    }
+
+    pub fn set_stereovision_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), EmoteRuntimeError> {
+        self.player.set_stereovision_enabled(enabled);
+        self.rebuild_scene()
+    }
+
+    pub fn stereovision_level(&self) -> f32 {
+        self.player.stereovision_level()
+    }
+
+    pub fn set_stereovision_level(&mut self, level: f32) -> Result<(), EmoteRuntimeError> {
+        self.player.set_stereovision_level(level);
+        self.rebuild_scene()
+    }
+
+    pub fn stereovision_fov(&self) -> f32 {
+        self.player.stereovision_fov()
+    }
+
+    pub fn set_stereovision_fov(&mut self, fov: f32) -> Result<(), EmoteRuntimeError> {
+        self.player.set_stereovision_fov(fov);
+        self.rebuild_scene()
+    }
+
+    pub fn stereovision_screen_index(&self) -> usize {
+        self.player.stereovision_screen_index()
+    }
+
+    pub fn set_stereovision_screen_index(
+        &mut self,
+        screen_index: usize,
+    ) -> Result<(), EmoteRuntimeError> {
+        self.player.set_stereovision_screen_index(screen_index);
+        self.rebuild_scene()
+    }
+
+    pub fn stereovision_screen_count(&self) -> usize {
+        self.player.stereovision_screen_count()
+    }
+
+    pub fn set_stereovision_screen_count(
+        &mut self,
+        screen_count: usize,
+    ) -> Result<(), EmoteRuntimeError> {
+        self.player.set_stereovision_screen_count(screen_count);
+        self.rebuild_scene()
+    }
+
+    pub fn evaluated_variable_values_for_stereovision_screen(
+        &self,
+        screen_index: usize,
+    ) -> BTreeMap<String, f32> {
+        self.player.evaluated_variable_values_for_screen(screen_index)
+    }
+
+    pub fn stereovision_screens_for_variable(
+        &self,
+        variable_name: &str,
+    ) -> Option<Vec<crate::runtime::EmoteStereovisionScreen>> {
+        self.player.stereovision_screens_for_variable(variable_name)
+    }
+
+    pub fn camera_runtime(&self) -> Option<&crate::emote::EmoteCameraRuntimeState> {
+        self.player.scene().camera_runtime.as_ref()
+    }
+
+    /// Camera state for every MMotionPlayer scope, including nested type-3
+    /// and particle child players. Keys are flattened scope-root layer paths.
+    pub fn camera_runtimes(
+        &self,
+    ) -> &BTreeMap<String, crate::emote::EmoteCameraRuntimeState> {
+        &self.player.scene().camera_runtimes
+    }
+
+    pub fn camera_runtime_for_scope(
+        &self,
+        scope_root_path: &str,
+    ) -> Option<&crate::emote::EmoteCameraRuntimeState> {
+        self.player.scene().camera_runtimes.get(scope_root_path)
+    }
+
     pub fn texture_bytes(&self, resource_index: u32) -> Option<&[u8]> {
         self.psb
             .resource_bytes(&self.normalized_data, resource_index as usize)
@@ -1022,7 +1158,7 @@ fn find_timeline_for_motion(player: &ElunaPlayer, motion: &str) -> Option<String
     player
         .timelines()
         .values()
-        .filter(|timeline| !timeline.name.starts_with("@control/") && !timeline.is_difference)
+        .filter(|timeline| !timeline.is_difference)
         .map(|timeline| &timeline.name)
         .find(|name| name.ends_with(&suffix))
         .cloned()
@@ -1030,20 +1166,11 @@ fn find_timeline_for_motion(player: &ElunaPlayer, motion: &str) -> Option<String
 
 fn initial_variable_values(
     infos: &[crate::EmoteVariableInfo],
-    timelines: &[crate::EmoteTimeline],
 ) -> BTreeMap<String, f32> {
-    let mut values: BTreeMap<String, f32> = infos
+    infos
         .iter()
         .map(|info| (info.name.clone(), info.default_value))
-        .collect();
-    for timeline in timelines {
-        for variable in &timeline.variables {
-            if let Some(first) = variable.frames.first() {
-                values.insert(variable.name.clone(), first.value);
-            }
-        }
-    }
-    values
+        .collect()
 }
 
 fn collect_chara_profiles(psb: &PsbFile) -> Vec<crate::EmoteCharaProfileInfo> {

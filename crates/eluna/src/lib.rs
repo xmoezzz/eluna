@@ -16,8 +16,10 @@ pub mod shader;
 pub mod vertex;
 
 pub use emote::{
-    load_emote_static_scene, EmoteDrawFrameInfo, EmoteDrawPass, EmoteMeshChainNode, EmoteMeshPatch,
-    EmoteModelSchema, EmoteMotionInfo, EmoteSceneBounds, EmoteSchemaError, EmoteStaticScene,
+    load_emote_static_scene, EmoteCameraRuntimeState, EmoteDrawFrameInfo, EmoteDrawPass,
+    EmoteFeedbackRuntimeState, EmoteGroundCorrectionHook, EmoteMeshChainNode, EmoteMeshPatch,
+    EmoteModelRuntimeState, EmoteModelSchema, EmoteMotionInfo, EmoteSceneBounds, EmoteSchemaError,
+    EmoteStereovisionControl, EmoteStereovisionProfile, EmoteStaticScene,
     EmoteStaticSprite, EmoteStepFrameInput, EmoteStepFrameLayerState, EmoteStepFrameMeshState,
     EmoteStepFrameOutput, EmoteTextureIcon, EmoteTextureSource,
 };
@@ -29,10 +31,11 @@ pub use psb::{
 pub use runtime::{
     collect_emote_runtime_pipeline, collect_emote_timelines, collect_emote_variables,
     BustPhysicsState, ClampControl, ElunaPlayer, EmoteApiLogEntry, EmoteCharaProfileInfo,
-    EmoteRuntimePipeline, EmoteTimeline, EmoteTimelineFrame, EmoteTimelineVariable,
-    EmoteVariableFrameInfo, EmoteVariableInfo, EmoteVariableState, EmoteVariableTarget,
-    HairPhysicsState, LoopControl, LoopTransition, MirrorControl, OpaqueControl, PhysicsControl,
-    PhysicsControlDefinition, SelectorControl, SelectorOption, TransitionControl, WindState,
+    EmoteRuntimePipeline, EmoteStereovisionScreen, EmoteTimeline, EmoteTimelineFrame,
+    EmoteTimelineVariable, EmoteVariableFrameInfo, EmoteVariableInfo, EmoteVariableState,
+    EmoteVariableTarget, HairPhysicsState, LoopControl, LoopTransition, MirrorControl, OpaqueControl,
+    PhysicsControl, PhysicsControlDefinition, SelectorControl, SelectorOption, TransitionControl,
+    WindPulse, WindState,
 };
 pub use schema::{
     collect_resource_refs, collect_schema_paths, top_level_keys, PsbPathEntry, PsbResourceRefs,

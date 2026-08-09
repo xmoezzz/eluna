@@ -4,7 +4,8 @@ use eluna::{
     build_d3d_triangle_strips, collect_emote_runtime_pipeline, collect_emote_timelines,
     collect_emote_variables, emote_ticks_to_milliseconds, expand_triangle_strips_to_list,
     milliseconds_to_emote_ticks, transform_order_mask, ElunaPlayer, EmoteDeviceRenderOptions,
-    EmoteDrawPass, EmoteModelSchema, EmotePlayerControl, EmoteSceneBounds, EmoteStaticScene,
+    EmoteDrawFrameInfo, EmoteDrawPass, EmoteModelSchema, EmotePlayerControl,
+    EmoteSceneBounds, EmoteStaticScene,
     EmoteStaticSprite, EmoteVertex, PhysicsControl, PsbDecryptionKey, PsbFile, PsbNormalizeOptions,
     TimelinePlayMode, VariableWrite, EMOTE_UPDATE_MS_CAP,
 };
@@ -63,12 +64,19 @@ struct VertexIn {
     @location(0) position: vec2<f32>,
     @location(1) texcoord: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) blend_mode: f32,
+    @location(4) clip_rect: vec4<f32>,
+    @location(5) wipe: vec3<f32>,
 };
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) texcoord: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) blend_mode: f32,
+    @location(3) model_position: vec2<f32>,
+    @location(4) clip_rect: vec4<f32>,
+    @location(5) wipe: vec3<f32>,
 };
 
 @vertex
@@ -83,86 +91,55 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.position = vec4<f32>(p.x, -p.y, 0.0, 1.0);
     out.texcoord = input.texcoord;
     out.color = input.color;
+    out.blend_mode = input.blend_mode;
+    out.model_position = input.position;
+    out.clip_rect = input.clip_rect;
+    out.wipe = input.wipe;
     return out;
+}
+
+fn native_texture_stage(input_c: vec4<f32>, blend_mode: u32) -> vec4<f32> {
+    // WGSL does not allow assigning to vector swizzles (for example c.rgb).
+    // Keep the RGB value as its own variable and reconstruct the vec4 on return.
+    var rgb = input_c.rgb;
+    let alpha = input_c.a;
+    // MMotionDevice::SetBlendMode (sub_1041A190): high nibble 0x10 sets
+    // D3DTOP_MODULATE2X on stage 0. Saturation occurs after texture*diffuse,
+    // not on diffuse before sampling.
+    if ((blend_mode & 0xF0u) == 0x10u) {
+        rgb = clamp(rgb * 2.0, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    let low = blend_mode & 0xFF0Fu;
+    // Modes 3/4 add stage 1 MODULATE(ALPHAREPLICATE|CURRENT, CURRENT),
+    // i.e. premultiply RGB by the current alpha before fixed-function blend.
+    if (low == 3u || low == 4u) {
+        rgb = rgb * alpha;
+    } else if (low == 5u) {
+        // Mode 5 stage 1 SELECTARG1(COMPLEMENT|CURRENT).
+        rgb = vec3<f32>(1.0) - rgb;
+    }
+    return vec4<f32>(rgb, alpha);
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    if (input.model_position.x < input.clip_rect.x || input.model_position.y < input.clip_rect.y ||
+        input.model_position.x > input.clip_rect.z || input.model_position.y > input.clip_rect.w) {
+        discard;
+    }
     var c = textureSample(sprite_tex, sprite_sampler, input.texcoord) * input.color;
+    if (input.wipe.z > 0.5) {
+        c = vec4<f32>(c.rgb, clamp(c.a * input.wipe.x + input.wipe.y, 0.0, 1.0));
+    }
+    c = native_texture_stage(c, u32(input.blend_mode + 0.5));
     if (c.a <= 0.003) {
         discard;
     }
-    return vec4<f32>(c.rgb * c.a, c.a);
+    return c;
 }
 "#;
 
-const MASKED_SHADER: &str = r#"
-struct Transform {
-    center: vec2<f32>,
-    viewport_scale: vec2<f32>,
-    player_coord: vec2<f32>,
-    player_scale: f32,
-    player_cos: f32,
-    player_sin: f32,
-    _pad: f32,
-};
 
-@group(0) @binding(0)
-var<uniform> transform: Transform;
-
-@group(1) @binding(0)
-var sprite_tex: texture_2d<f32>;
-
-@group(1) @binding(1)
-var sprite_sampler: sampler;
-
-@group(2) @binding(0)
-var mask_tex: texture_2d<f32>;
-
-@group(2) @binding(1)
-var mask_sampler: sampler;
-
-struct VertexIn {
-    @location(0) position: vec2<f32>,
-    @location(1) texcoord: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
-
-struct VertexOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) texcoord: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) mask_uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(input: VertexIn) -> VertexOut {
-    var out: VertexOut;
-    let p0 = (input.position - transform.center) * transform.player_scale;
-    let p1 = vec2<f32>(
-        p0.x * transform.player_cos - p0.y * transform.player_sin,
-        p0.x * transform.player_sin + p0.y * transform.player_cos,
-    ) + transform.player_coord;
-    let p = p1 * transform.viewport_scale;
-    let ndc = vec2<f32>(p.x, -p.y);
-    out.position = vec4<f32>(ndc.x, ndc.y, 0.0, 1.0);
-    out.texcoord = input.texcoord;
-    out.color = input.color;
-    out.mask_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    return out;
-}
-
-@fragment
-fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    var c = textureSample(sprite_tex, sprite_sampler, input.texcoord) * input.color;
-    let m = textureSample(mask_tex, mask_sampler, input.mask_uv).a;
-    let out_alpha = c.a * m;
-    if (out_alpha <= 0.003) {
-        discard;
-    }
-    return vec4<f32>(c.rgb * out_alpha, out_alpha);
-}
-"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -170,10 +147,14 @@ struct GpuSpriteVertex {
     position: [f32; 2],
     texcoord: [f32; 2],
     color: [f32; 4],
+    blend_mode: f32,
+    clip_rect: [f32; 4],
+    /// Native type-12 wipe: [scale, bias, enabled].
+    wipe: [f32; 3],
 }
 
 impl GpuSpriteVertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
+    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
         wgpu::VertexAttribute {
             offset: 0,
             shader_location: 0,
@@ -188,6 +169,21 @@ impl GpuSpriteVertex {
             offset: 16,
             shader_location: 2,
             format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: 32,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Float32,
+        },
+        wgpu::VertexAttribute {
+            offset: 36,
+            shader_location: 4,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: 52,
+            shader_location: 5,
+            format: wgpu::VertexFormat::Float32x3,
         },
     ];
 
@@ -204,6 +200,9 @@ impl GpuSpriteVertex {
             position: [vertex.x, vertex.y],
             texcoord: [0.0, 0.0],
             color: vertex.diffuse_rgba_f32(),
+            blend_mode: 0.0,
+            clip_rect: [-1.0e30, -1.0e30, 1.0e30, 1.0e30],
+            wipe: [1.0, 0.0, 0.0],
         }
     }
 }
@@ -260,7 +259,6 @@ struct UiState {
     layer_filter_visible_only: bool,
     selected_layer: Option<String>,
     playback_speed: f32,
-    timeline_loop: bool,
     main_timeline: String,
     diff_timeline_slots: [String; 6],
     diff_fadeout_ms: f32,
@@ -287,7 +285,6 @@ impl Default for UiState {
             layer_filter_visible_only: false,
             selected_layer: None,
             playback_speed: 1.0,
-            timeline_loop: true,
             main_timeline: String::new(),
             diff_timeline_slots: Default::default(),
             diff_fadeout_ms: 300.0,
@@ -325,7 +322,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let variables = collect_emote_variables(&psb);
         let timelines = collect_emote_timelines(&psb);
         let runtime_pipeline = collect_emote_runtime_pipeline(&psb);
-        let default_variable_values = default_variable_values(&variables, &timelines);
+        let default_variable_values = default_variable_values(&variables);
         let mut scene = if let Some(motion) = active_motion.as_deref() {
             schema.build_motion_scene_at_with_resources_and_variables(
                 &psb,
@@ -353,7 +350,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .and_then(|motion| find_timeline_for_motion(&player, motion))
             });
             if let Some(name) = timeline_to_play {
-                player.play_timeline(&name, TimelinePlayMode::PARALLEL.with_looping(true));
+                player.play_timeline(&name, TimelinePlayMode::ONCE);
                 if let Some(ticks) = options.timeline_time {
                     player
                         .set_timeline_time(&name, ticks)
@@ -367,8 +364,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &psb,
                 &normalized_data,
                 motion,
-                active_main_timeline_time_ticks(&player).unwrap_or(0.0),
-                &player_variable_values(&player),
+                player.elapsed_ticks(),
+                &player.evaluated_variable_values(),
             )?;
             player.replace_scene(scene.clone());
         }
@@ -532,22 +529,31 @@ fn player_variable_values(player: &ElunaPlayer) -> BTreeMap<String, f32> {
         .collect()
 }
 
+fn player_evaluated_variable_values(player: &ElunaPlayer) -> BTreeMap<String, f32> {
+    player.evaluated_variable_values()
+}
+
 fn rebuild_loaded_model_scene(
     model: &mut LoadedModel,
     physics_delta_ticks: f32,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(motion_name) = model.active_motion.as_deref() {
-        let variable_values = player_variable_values(&model.player);
-        let scene_time_ticks = active_main_timeline_time_ticks(&model.player)
-            .unwrap_or_else(|| model.player.elapsed_ticks());
+        // MMotionPlayer motion time (+284) is independent from TimelineControl
+        // elapsed time.  Preserve the complete previous scene so native type-0
+        // frame HOLD and nested-motion dt=2 displacement both see last frame's
+        // state.
+        let previous_scene = model.scene.clone();
+        let variable_values = player_evaluated_variable_values(&model.player);
+        let scene_time_ticks = model.player.elapsed_ticks();
         let scene = model
             .schema
-            .build_motion_scene_at_with_resources_and_variables(
+            .build_motion_scene_at_with_resources_variables_and_previous_scene(
                 &model.psb,
                 &model.normalized_data,
                 motion_name,
                 scene_time_ticks,
                 &variable_values,
+                &previous_scene,
             )?;
         model.scene = scene;
         model.player.replace_scene(model.scene.clone());
@@ -555,15 +561,16 @@ fn rebuild_loaded_model_scene(
             model
                 .player
                 .evaluate_physics_for_current_scene(physics_delta_ticks);
-            let variable_values = player_variable_values(&model.player);
+            let variable_values = player_evaluated_variable_values(&model.player);
             let scene = model
                 .schema
-                .build_motion_scene_at_with_resources_and_variables(
+                .build_motion_scene_at_with_resources_variables_and_previous_scene(
                     &model.psb,
                     &model.normalized_data,
                     motion_name,
                     scene_time_ticks,
                     &variable_values,
+                    &previous_scene,
                 )?;
             model.scene = scene;
             model.player.replace_scene(model.scene.clone());
@@ -572,30 +579,14 @@ fn rebuild_loaded_model_scene(
     Ok(())
 }
 
-fn active_main_timeline_time_ticks(player: &ElunaPlayer) -> Option<f32> {
-    player
-        .active_timelines()
-        .iter()
-        .find(|(name, mode)| !name.starts_with("@control/") && !mode.is_difference())
-        .map(|(name, _)| player.timeline_elapsed_ticks(name))
-}
 
 fn default_variable_values(
     infos: &[eluna::EmoteVariableInfo],
-    timelines: &[eluna::EmoteTimeline],
 ) -> BTreeMap<String, f32> {
-    let mut values: BTreeMap<String, f32> = infos
+    infos
         .iter()
         .map(|info| (info.name.clone(), info.default_value))
-        .collect();
-    for timeline in timelines {
-        for variable in &timeline.variables {
-            if let Some(first) = variable.frames.first() {
-                values.insert(variable.name.clone(), first.value);
-            }
-        }
-    }
-    values
+        .collect()
 }
 
 fn find_timeline_for_motion(player: &ElunaPlayer, motion: &str) -> Option<String> {
@@ -606,7 +597,7 @@ fn find_timeline_for_motion(player: &ElunaPlayer, motion: &str) -> Option<String
     if let Some(name) = player
         .timelines()
         .values()
-        .filter(|timeline| !timeline.name.starts_with("@control/") && !timeline.is_difference)
+        .filter(|timeline| !timeline.is_difference)
         .map(|timeline| &timeline.name)
         .find(|name| name.ends_with(&suffix))
         .cloned()
@@ -616,7 +607,7 @@ fn find_timeline_for_motion(player: &ElunaPlayer, motion: &str) -> Option<String
     player
         .timelines()
         .values()
-        .filter(|timeline| !timeline.name.starts_with("@control/") && !timeline.is_difference)
+        .filter(|timeline| !timeline.is_difference)
         .map(|timeline| timeline.name.clone())
         .next()
 }
@@ -1265,11 +1256,12 @@ fn debug_runtime_frame(
                 _ => "draw",
             };
             eprintln!(
-                "  [{:>3}] z={:>6.2} di={:>3} pass={:<24} stencil={} masks={} op={:.2} vis={} tex={} \
+                "  [{:>3}] z={:>6.2} di={:>3} key={:?} pass={:<24} stencil={} masks={} op={:.2} vis={} tex={} \
                  size={:.0}x{:.0} path='{}' label={:?} {}",
                 order,
                 sprite.z,
                 sprite.draw_frame_info.draw_index,
+                sprite.draw_frame_info.native_draw_key,
                 format!("{:?}", sprite.draw_frame_info.pass),
                 sprite.draw_frame_info.stencil_type,
                 sprite.draw_frame_info.stencil_composite_mask_layer_list.len(),
@@ -1410,14 +1402,22 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    mask_pipeline: wgpu::RenderPipeline,
-    masked_pipeline: wgpu::RenderPipeline,
-    mask_bind_group_layout: wgpu::BindGroupLayout,
-    mask_sampler: wgpu::Sampler,
-    mask_format: wgpu::TextureFormat,
-    mask_size: (u32, u32),
-    mask_targets: BTreeMap<u32, MaskCacheEntry>,
+    /// Native MMotionDevice blend modes 0..5 recovered from sub_1041A190.
+    pipelines: Vec<wgpu::RenderPipeline>,
+    /// Same color pipelines with D3DSTENCILFUNC=EQUAL semantics.
+    stencil_color_pipelines: Vec<wgpu::RenderPipeline>,
+    /// MMotionDevice::PrepareInnerMask: EQUAL(ref), INCR on covered fragments.
+    stencil_inner_pipeline: wgpu::RenderPipeline,
+    /// MMotionDevice::PrepareOuterMask: EQUAL(ref), DECR on covered fragments.
+    stencil_outer_pipeline: wgpu::RenderPipeline,
+    stencil_format: wgpu::TextureFormat,
+    stencil_texture: wgpu::Texture,
+    stencil_view: wgpu::TextureView,
+    /// Previous engine framebuffer used by native type-10 Feedback layers.
+    feedback_texture: GpuTexture,
+    feedback_history_valid: bool,
+    feedback_copy_supported: bool,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
     transform_buffer: wgpu::Buffer,
     transform_bind_group: wgpu::BindGroup,
     textures: Vec<GpuTexture>,
@@ -1435,22 +1435,250 @@ struct GpuTexture {
     bind_group: wgpu::BindGroup,
 }
 
-struct GpuDraw {
+struct GpuStencilSource {
     texture_slot: usize,
+    feedback_history: bool,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
+}
+
+struct GpuStencilGroup {
+    /// Native stencilType low bits: 1=inner, 2=outer.
+    phase: u32,
+    sources: Vec<GpuStencilSource>,
+}
+
+struct GpuDraw {
+    texture_slot: usize,
+    feedback_history: bool,
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+    blend_mode: u32,
     pass: EmoteDrawPass,
+    /// Retained for diagnostics; the native renderer now uses the full +120
+    /// stencil-owner chain rather than an alpha-mask reference texture.
     mask_reference: u32,
     parent_mask_reference: u32,
+    stencil_groups: Vec<GpuStencilGroup>,
+    stencil_initial_reference: u32,
+    stencil_final_reference: u32,
 }
 
-struct MaskCacheEntry {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
+
+fn native_blend_state(mode: u32) -> wgpu::BlendState {
+    // MMotionDevice::SetBlendMode (sub_1041A190) indexes three D3D9 tables:
+    //   D3DRS_BLENDOP  = [ADD, ADD, REVSUBTRACT, ADD, ADD, REVSUBTRACT]
+    //   D3DRS_DESTBLEND= [INVSRCALPHA, ONE, ONE, INVSRCALPHA, ONE, ONE]
+    //   D3DRS_SRCBLEND = [SRCALPHA, SRCALPHA, SRCALPHA,
+    //                     DESTCOLOR, INVDESTCOLOR, SRCALPHA]
+    let (operation, src_factor, dst_factor) = match mode {
+        1 => (
+            wgpu::BlendOperation::Add,
+            wgpu::BlendFactor::SrcAlpha,
+            wgpu::BlendFactor::One,
+        ),
+        2 | 5 => (
+            wgpu::BlendOperation::ReverseSubtract,
+            wgpu::BlendFactor::SrcAlpha,
+            wgpu::BlendFactor::One,
+        ),
+        3 => (
+            wgpu::BlendOperation::Add,
+            wgpu::BlendFactor::Dst,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        ),
+        4 => (
+            wgpu::BlendOperation::Add,
+            wgpu::BlendFactor::OneMinusDst,
+            wgpu::BlendFactor::One,
+        ),
+        _ => (
+            wgpu::BlendOperation::Add,
+            wgpu::BlendFactor::SrcAlpha,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        ),
+    };
+    let color = wgpu::BlendComponent {
+        src_factor,
+        dst_factor,
+        operation,
+    };
+    // sub_1041A190 enables separate alpha blending. With the native default
+    // alpha mode, normal blending is src.a + dst.a*(1-src.a); every non-zero
+    // blend mode preserves destination alpha (ZERO, ONE, ADD).
+    let alpha = if mode == 0 {
+        wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        }
+    } else {
+        wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        }
+    };
+    wgpu::BlendState { color, alpha }
 }
 
-fn create_alpha_mask_target(
+fn native_blend_index(blend_mode: u32) -> usize {
+    match blend_mode & 0xFF0F {
+        0..=5 => (blend_mode & 0xFF0F) as usize,
+        _ => 0,
+    }
+}
+
+fn create_color_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    native_blend_mode: u32,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[GpuSpriteVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(native_blend_state(native_blend_mode)),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_native_color_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    label_prefix: &str,
+) -> Vec<wgpu::RenderPipeline> {
+    (0..6)
+        .map(|mode| {
+            let label = format!("{label_prefix} blend {mode}");
+            create_color_pipeline(device, layout, shader, color_format, mode, &label)
+        })
+        .collect()
+}
+
+
+fn native_stencil_face(compare: wgpu::CompareFunction, pass_op: wgpu::StencilOperation) -> wgpu::StencilFaceState {
+    wgpu::StencilFaceState {
+        compare,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: pass_op,
+        pass_op,
+    }
+}
+
+fn create_stencil_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    stencil_format: wgpu::TextureFormat,
+    blend_mode: Option<u32>,
+    compare: wgpu::CompareFunction,
+    pass_op: wgpu::StencilOperation,
+    color_write: bool,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    let face = native_stencil_face(compare, pass_op);
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[GpuSpriteVertex::layout()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: blend_mode.map(native_blend_state),
+                write_mask: if color_write { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: stencil_format,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState {
+                front: face,
+                back: face,
+                read_mask: 0xff,
+                write_mask: 0xff,
+            },
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_native_stencil_color_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    stencil_format: wgpu::TextureFormat,
+    label_prefix: &str,
+) -> Vec<wgpu::RenderPipeline> {
+    (0..6)
+        .map(|mode| {
+            create_stencil_pipeline(
+                device,
+                layout,
+                shader,
+                color_format,
+                stencil_format,
+                Some(mode),
+                wgpu::CompareFunction::Equal,
+                wgpu::StencilOperation::Keep,
+                true,
+                &format!("{label_prefix} blend {mode}"),
+            )
+        })
+        .collect()
+}
+
+fn create_stencil_target(
     device: &wgpu::Device,
     width: u32,
     height: u32,
@@ -1468,86 +1696,67 @@ fn create_alpha_mask_target(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
 }
 
-fn create_alpha_mask_bind_group(
+fn create_feedback_target(
     device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
+    texture_layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> GpuTexture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("eluna feedback history"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("eluna feedback sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("eluna feedback bind group"),
+        layout: texture_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(view),
+                resource: wgpu::BindingResource::TextureView(&view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
+                resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
-    })
+    });
+    GpuTexture {
+        _texture: texture,
+        _view: view,
+        _sampler: sampler,
+        bind_group,
+    }
 }
 
-fn create_color_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    shader: &wgpu::ShaderModule,
-    color_format: wgpu::TextureFormat,
-    label: &'static str,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[GpuSpriteVertex::layout()],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: color_format,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
 
 impl GpuState {
     async fn new(
@@ -1592,6 +1801,13 @@ impl GpuState {
                 )
             })?;
         config.desired_maximum_frame_latency = 2;
+        let surface_caps = surface.get_capabilities(&adapter);
+        let feedback_copy_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if feedback_copy_supported {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        } else {
+            eprintln!("eluna warning: surface does not support COPY_SRC; framebuffer feedback is disabled");
+        }
         eprintln!("eluna surface format: {:?}", config.format);
         surface.configure(&device, &config);
 
@@ -1633,36 +1849,9 @@ impl GpuState {
                 ],
             });
 
-        let mask_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("eluna alpha mask bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("eluna sprite shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let masked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("eluna masked sprite shader"),
-            source: wgpu::ShaderSource::Wgsl(MASKED_SHADER.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1673,53 +1862,66 @@ impl GpuState {
             ],
             immediate_size: 0,
         });
-        let masked_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("eluna masked sprite pipeline layout"),
-                bind_group_layouts: &[
-                    Some(&transform_bind_group_layout),
-                    Some(&texture_bind_group_layout),
-                    Some(&mask_bind_group_layout),
-                ],
-                immediate_size: 0,
-            });
 
-        // Mask compositing follows the official JS Tyrano renderer (ALPHA mask
-        // mode, stencil disabled, depth disabled).  Each parent mask reference
-        // owns its own Rgba8Unorm alpha texture; masked color items sample the
-        // corresponding texture instead of using a shared stencil buffer.
-        let mask_format = wgpu::TextureFormat::Rgba8Unorm;
-        let pipeline = create_color_pipeline(
+        // Native MMotionDevice stencil mode recovered from
+        // BeginCreateMask/PrepareInnerMask/PrepareOuterMask/EndCreateMask:
+        // clear to the initial reference, inner masks EQUAL+INCR (D3D9 op 7,
+        // wrapping), outer masks EQUAL+DECR (D3D9 op 8, wrapping), then render
+        // color only where stencil == final reference.
+        let stencil_format = wgpu::TextureFormat::Depth24PlusStencil8;
+        let pipelines = create_native_color_pipelines(
             &device,
             &pipeline_layout,
             &shader,
             config.format,
             "eluna sprite pipeline",
         );
-        let mask_pipeline = create_color_pipeline(
+        let stencil_color_pipelines = create_native_stencil_color_pipelines(
             &device,
             &pipeline_layout,
             &shader,
-            mask_format,
-            "eluna alpha mask writer pipeline",
-        );
-        let masked_pipeline = create_color_pipeline(
-            &device,
-            &masked_pipeline_layout,
-            &masked_shader,
             config.format,
-            "eluna masked sprite pipeline",
+            stencil_format,
+            "eluna stencil color pipeline",
         );
-        let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("eluna alpha mask sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let stencil_inner_pipeline = create_stencil_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            config.format,
+            stencil_format,
+            None,
+            wgpu::CompareFunction::Equal,
+            wgpu::StencilOperation::IncrementWrap,
+            false,
+            "eluna stencil inner mask pipeline",
+        );
+        let stencil_outer_pipeline = create_stencil_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            config.format,
+            stencil_format,
+            None,
+            wgpu::CompareFunction::Equal,
+            wgpu::StencilOperation::DecrementWrap,
+            false,
+            "eluna stencil outer mask pipeline",
+        );
+        let (stencil_texture, stencil_view) = create_stencil_target(
+            &device,
+            width,
+            height,
+            stencil_format,
+            "eluna stencil target",
+        );
+        let feedback_texture = create_feedback_target(
+            &device,
+            &texture_bind_group_layout,
+            width,
+            height,
+            config.format,
+        );
 
         let transform = TransformUniform {
             center: [0.0, 0.0],
@@ -1769,14 +1971,17 @@ impl GpuState {
             device,
             queue,
             config,
-            pipeline,
-            mask_pipeline,
-            masked_pipeline,
-            mask_bind_group_layout,
-            mask_sampler,
-            mask_format,
-            mask_size: (width, height),
-            mask_targets: BTreeMap::new(),
+            pipelines,
+            stencil_color_pipelines,
+            stencil_inner_pipeline,
+            stencil_outer_pipeline,
+            stencil_format,
+            stencil_texture,
+            stencil_view,
+            feedback_texture,
+            feedback_history_valid: false,
+            feedback_copy_supported,
+            texture_bind_group_layout,
             transform_buffer,
             transform_bind_group,
             textures,
@@ -1801,47 +2006,24 @@ impl GpuState {
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
-        // Mask textures are sized to match the surface so the masked-color
-        // shader's screen-space mask UV matches the parent mask coverage.
-        // Drop the cache; entries are reallocated lazily before the next pass.
-        self.mask_size = (self.config.width, self.config.height);
-        self.mask_targets.clear();
+        let (texture, view) = create_stencil_target(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            self.stencil_format,
+            "eluna stencil target",
+        );
+        self.stencil_texture = texture;
+        self.stencil_view = view;
+        self.feedback_texture = create_feedback_target(
+            &self.device,
+            &self.texture_bind_group_layout,
+            self.config.width,
+            self.config.height,
+            self.config.format,
+        );
+        self.feedback_history_valid = false;
         self.update_transform(None);
-    }
-
-    fn ensure_mask_targets<I>(&mut self, references: I)
-    where
-        I: IntoIterator<Item = u32>,
-    {
-        use std::collections::BTreeSet;
-        let needed: BTreeSet<u32> = references.into_iter().filter(|&r| r != 0).collect();
-        let (width, height) = self.mask_size;
-        // Drop entries for references that are no longer in use; their textures
-        // would otherwise carry stale mask coverage into a future frame.
-        self.mask_targets.retain(|key, _| needed.contains(key));
-        for reference in needed {
-            if self.mask_targets.contains_key(&reference) {
-                continue;
-            }
-            let label = format!("eluna alpha mask #{}", reference);
-            let (texture, view) =
-                create_alpha_mask_target(&self.device, width, height, self.mask_format, &label);
-            let bind_group = create_alpha_mask_bind_group(
-                &self.device,
-                &self.mask_bind_group_layout,
-                &view,
-                &self.mask_sampler,
-                &format!("eluna alpha mask bind group #{}", reference),
-            );
-            self.mask_targets.insert(
-                reference,
-                MaskCacheEntry {
-                    _texture: texture,
-                    view,
-                    bind_group,
-                },
-            );
-        }
     }
 
     fn update_transform(&self, player: Option<&ElunaPlayer>) {
@@ -1851,11 +2033,29 @@ impl GpuState {
         let viewport_w = self.config.width.max(1) as f32;
         let viewport_h = self.config.height.max(1) as f32;
         let fit = 0.9 * (viewport_w / bounds_w).min(viewport_h / bounds_h);
-        let (player_coord, player_scale, player_rot) = if let Some(player) = player {
-            (player.coord(), player.scale(), player.rot())
+        let (mut player_coord, player_scale, player_rot) = if let Some(player) = player {
+            let scale = player.scale();
+            let mut coord = player.coord();
+            // IEmotePlayer::transform_order_mask_t position channel:
+            // TRANSLATE_TO_SCALE means the public coordinate is translated
+            // before player scale, so the resulting screen-space translation
+            // is scaled as well. The shader implements SCALE_TO_TRANSLATE by
+            // default, therefore fold the other ordering into the uniform.
+            if (player.transform_order_mask()
+                & transform_order_mask::POSITION_TRANSLATE_TO_SCALE)
+                != 0
+            {
+                coord[0] *= scale;
+                coord[1] *= scale;
+            }
+            (coord, scale, player.rot())
         } else {
             ([0.0, 0.0], 1.0, 0.0)
         };
+        // Native StepFrameCamera stores a rounded Vec2 at MMotionPlayer+0x1d4,
+        // but the standard 2-D DrawFrameInfo/MMotionRenderer path does not
+        // consume that field. It is host-facing Camera state (with dedicated
+        // accessors), so do not invent a global sprite translation here.
         let uniform = TransformUniform {
             center,
             viewport_scale: [fit * 2.0 / viewport_w, fit * 2.0 / viewport_h],
@@ -1867,6 +2067,14 @@ impl GpuState {
         };
         self.queue
             .write_buffer(&self.transform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn resolve_draw_texture(&self, feedback_history: bool, texture_slot: usize) -> Option<&GpuTexture> {
+        if feedback_history {
+            self.feedback_history_valid.then_some(&self.feedback_texture)
+        } else {
+            self.textures.get(texture_slot)
+        }
     }
 
     fn render(
@@ -1954,76 +2162,12 @@ impl GpuState {
         };
         let player_visible = player.map(|player| player.is_shown()).unwrap_or(true);
 
-        // Collect the parent mask references this frame uses so each one gets
-        // its own Rgba8Unorm alpha texture.  Sharing one texture across groups
-        // would erase coverage that a later masked-color draw still needs.
-        let mut mask_refs_needed = std::collections::BTreeSet::<u32>::new();
-        if player_visible {
-            for draw in &self.draws {
-                if draw.parent_mask_reference != 0 {
-                    mask_refs_needed.insert(draw.parent_mask_reference);
-                }
-            }
-        }
-        self.ensure_mask_targets(mask_refs_needed.iter().copied());
-
-        if player_visible {
-            // Build each parent mask reference's alpha texture once per frame.
-            // Mask source items keep their drawFrameInfo emission order; we
-            // simply filter by mask_reference so the texture contains the alpha
-            // coverage for that reference and nothing else.
-            for &reference in &mask_refs_needed {
-                let Some(entry) = self.mask_targets.get(&reference) else {
-                    continue;
-                };
-                let mut mask_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("eluna alpha mask reference pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &entry.view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 0.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                    multiview_mask: None,
-                });
-                mask_pass.set_pipeline(&self.mask_pipeline);
-                mask_pass.set_bind_group(0, &self.transform_bind_group, &[]);
-                for draw in &self.draws {
-                    if draw.mask_reference != reference {
-                        continue;
-                    }
-                    if draw.pass != EmoteDrawPass::MaskGeneration
-                        && draw.pass != EmoteDrawPass::StencilCompositeMask
-                    {
-                        continue;
-                    }
-                    let Some(texture) = self.textures.get(draw.texture_slot) else {
-                        continue;
-                    };
-                    mask_pass.set_bind_group(1, &texture.bind_group, &[]);
-                    mask_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                    mask_pass.draw(0..draw.vertex_count, 0..1);
-                }
-            }
-        }
-
-        // Single color pass consumes the drawFrameInfo stream in original order.
-        // Pipeline switches per draw based on whether the item samples a parent
-        // mask; we never resort and never reuse a shared stencil reference.
+        // Clear the frame once. Native masks are reconstructed immediately
+        // before each masked color item because DrawFrameInfo+120 is an
+        // ancestor chain, not a persistent per-owner alpha texture.
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("eluna color drawFrameInfo pass"),
+            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("eluna frame clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -2038,53 +2182,140 @@ impl GpuState {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            if player_visible {
-                #[derive(Copy, Clone, PartialEq, Eq)]
-                enum Mode {
-                    None,
-                    Color,
-                    Masked,
+        }
+
+        if player_visible {
+            for draw in &self.draws {
+                if draw.pass == EmoteDrawPass::MaskGeneration
+                    || draw.pass == EmoteDrawPass::StencilCompositeMask
+                {
+                    continue;
                 }
-                let mut mode = Mode::None;
-                for draw in &self.draws {
-                    if draw.pass == EmoteDrawPass::MaskGeneration
-                        || draw.pass == EmoteDrawPass::StencilCompositeMask
-                    {
-                        continue;
-                    }
-                    let Some(texture) = self.textures.get(draw.texture_slot) else {
-                        continue;
-                    };
-                    if draw.parent_mask_reference != 0 {
-                        let Some(mask_entry) = self.mask_targets.get(&draw.parent_mask_reference)
-                        else {
-                            continue;
-                        };
-                        if mode != Mode::Masked {
-                            pass.set_pipeline(&self.masked_pipeline);
-                            // Re-bind every group after a pipeline switch.  The
-                            // masked pipeline layout has 3 bind groups while the
-                            // normal pipeline layout has 2; wgpu treats the
-                            // groups beyond the previous pipeline's layout as
-                            // unset, and re-binding 0 is cheap insurance against
-                            // any cross-pipeline state aliasing.
-                            pass.set_bind_group(0, &self.transform_bind_group, &[]);
-                            mode = Mode::Masked;
-                        }
-                        pass.set_bind_group(2, &mask_entry.bind_group, &[]);
-                        pass.set_bind_group(1, &texture.bind_group, &[]);
-                    } else {
-                        if mode != Mode::Color {
-                            pass.set_pipeline(&self.pipeline);
-                            pass.set_bind_group(0, &self.transform_bind_group, &[]);
-                            mode = Mode::Color;
-                        }
-                        pass.set_bind_group(1, &texture.bind_group, &[]);
-                    }
+                let Some(texture) = self.resolve_draw_texture(draw.feedback_history, draw.texture_slot) else {
+                    continue;
+                };
+                let blend_index = native_blend_index(draw.blend_mode);
+
+                if draw.stencil_groups.is_empty() {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("eluna native color item"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.pipelines[blend_index]);
+                    pass.set_bind_group(0, &self.transform_bind_group, &[]);
+                    pass.set_bind_group(1, &texture.bind_group, &[]);
                     pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     pass.draw(0..draw.vertex_count, 0..1);
+                    continue;
                 }
+
+                // Exact stencil-mode state machine recovered from
+                // MMotionDevice::BeginCreateMask / PrepareInnerMask /
+                // PrepareOuterMask / EndCreateMask. An outer mask seeds the
+                // clear value at 1. Every inner chain node increments only
+                // pixels equal to the current reference; all outer masks then
+                // decrement pixels equal to the final reference. The color
+                // item passes only where the final reference remains intact.
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("eluna native stencil item"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.stencil_view,
+                        depth_ops: None,
+                        stencil_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(draw.stencil_initial_reference),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                    }),
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &self.transform_bind_group, &[]);
+
+                let mut reference = draw.stencil_initial_reference;
+                for group in draw.stencil_groups.iter().filter(|group| group.phase == 1) {
+                    pass.set_pipeline(&self.stencil_inner_pipeline);
+                    pass.set_stencil_reference(reference);
+                    for source in &group.sources {
+                        let Some(mask_texture) = self.resolve_draw_texture(source.feedback_history, source.texture_slot) else {
+                            continue;
+                        };
+                        pass.set_bind_group(1, &mask_texture.bind_group, &[]);
+                        pass.set_vertex_buffer(0, source.vertex_buffer.slice(..));
+                        pass.draw(0..source.vertex_count, 0..1);
+                    }
+                    reference = reference.saturating_add(1).min(255);
+                }
+                let final_reference = draw.stencil_final_reference;
+                if draw.stencil_groups.iter().any(|group| group.phase == 2) {
+                    pass.set_pipeline(&self.stencil_outer_pipeline);
+                    pass.set_stencil_reference(final_reference);
+                    for group in draw.stencil_groups.iter().filter(|group| group.phase == 2) {
+                        for source in &group.sources {
+                            let Some(mask_texture) = self.resolve_draw_texture(source.feedback_history, source.texture_slot) else {
+                                continue;
+                            };
+                            pass.set_bind_group(1, &mask_texture.bind_group, &[]);
+                            pass.set_vertex_buffer(0, source.vertex_buffer.slice(..));
+                            pass.draw(0..source.vertex_count, 0..1);
+                        }
+                    }
+                }
+
+                pass.set_pipeline(&self.stencil_color_pipelines[blend_index]);
+                pass.set_stencil_reference(final_reference);
+                pass.set_bind_group(1, &texture.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.draw(0..draw.vertex_count, 0..1);
             }
+        }
+
+        // Native type-10 Feedback samples the previous engine framebuffer.
+        // Capture the just-rendered Emote scene before the egui overlay so UI
+        // pixels never leak into feedback history. The history becomes visible
+        // to feedback draws on the next host frame.
+        let captured_feedback_history = self.feedback_copy_supported;
+        if captured_feedback_history {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.feedback_texture._texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.config.width.max(1),
+                    height: self.config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
         // Egui overlay pass. Texture uploads were already processed before
@@ -2127,6 +2358,9 @@ impl GpuState {
         }
 
         self.queue.submit(Some(encoder.finish()));
+        if captured_feedback_history {
+            self.feedback_history_valid = true;
+        }
         for id in &egui_textures_to_free {
             self.egui_renderer.free_texture(id);
         }
@@ -2195,6 +2429,99 @@ fn build_model_assets(
     Ok((textures, texture_slots, draws, bounds))
 }
 
+fn gpu_stencil_source(
+    device: &wgpu::Device,
+    texture_slots: &BTreeMap<u32, usize>,
+    sprite: &EmoteStaticSprite,
+) -> Result<GpuStencilSource, Box<dyn Error>> {
+    let texture_slot = if sprite.feedback_history {
+        0
+    } else {
+        *texture_slots
+            .get(&sprite.texture_resource_index)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "stencil texture resource was not loaded"))?
+    };
+    let vertices = sprite_vertices(sprite);
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("eluna native stencil vertices"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    Ok(GpuStencilSource {
+        texture_slot,
+        feedback_history: sprite.feedback_history,
+        vertex_buffer,
+        vertex_count: vertices.len() as u32,
+    })
+}
+
+fn stencil_groups_for_sprite(
+    device: &wgpu::Device,
+    texture_slots: &BTreeMap<u32, usize>,
+    scene: &EmoteStaticScene,
+    key_to_sprite: &BTreeMap<Vec<u64>, &EmoteStaticSprite>,
+    layer_infos: &BTreeMap<Vec<u64>, &EmoteDrawFrameInfo>,
+    sprite: &EmoteStaticSprite,
+) -> Result<(Vec<GpuStencilGroup>, u32, u32), Box<dyn Error>> {
+    let mut chain = Vec::<&EmoteDrawFrameInfo>::new();
+    let mut cursor = sprite.draw_frame_info.stencil_parent_native_key.as_ref();
+    let mut visited = std::collections::BTreeSet::<Vec<u64>>::new();
+    while let Some(key) = cursor {
+        if !visited.insert(key.clone()) {
+            break;
+        }
+        let Some(info) = layer_infos.get(key).copied() else {
+            break;
+        };
+        if matches!(info.stencil_phase, 1 | 2) {
+            chain.push(info);
+        }
+        cursor = info.stencil_parent_native_key.as_ref();
+    }
+    if chain.is_empty() {
+        return Ok((Vec::new(), 0, 0));
+    }
+
+    // sub_101D0DD0 scans the chain for phase 2 before BeginCreateMask:
+    // outer-mask presence chooses clear stencil=1, otherwise clear=0.
+    let initial_reference: u32 = if chain.iter().any(|info| info.stencil_phase == 2) { 1 } else { 0 };
+    let mut final_reference: u32 = initial_reference;
+    let mut groups = Vec::<GpuStencilGroup>::new();
+
+    // Native dword_1050425C is {1, 2}: process every Inner node first,
+    // incrementing the expected reference once per owner, then all Outer nodes.
+    for phase in [1i64, 2i64] {
+        for info in chain.iter().copied().filter(|info| info.stencil_phase == phase) {
+            let source_keys: Vec<Vec<u64>> = if (info.stencil_type & 4) != 0 {
+                scene
+                    .composite_mask_sources_by_key
+                    .get(&info.native_draw_key)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                vec![info.native_draw_key.clone()]
+            };
+            let mut sources = Vec::<GpuStencilSource>::new();
+            for source_key in source_keys {
+                if let Some(source_sprite) = key_to_sprite.get(&source_key).copied() {
+                    sources.push(gpu_stencil_source(device, texture_slots, source_sprite)?);
+                }
+            }
+            groups.push(GpuStencilGroup {
+                phase: phase as u32,
+                sources,
+            });
+            if phase == 1 {
+                // PrepareInnerMask is called once per chain owner, even for a
+                // composite source list. Its EQUAL+INCR state makes multiple
+                // source sprites form a union without double incrementing.
+                final_reference = final_reference.saturating_add(1).min(255);
+            }
+        }
+    }
+    Ok((groups, initial_reference, final_reference))
+}
+
 fn build_scene_draws(
     device: &wgpu::Device,
     scene: &EmoteStaticScene,
@@ -2206,28 +2533,18 @@ fn build_scene_draws(
         .filter(|sprite| sprite.visible && sprite.opacity > 0.0)
         .collect();
 
-    let mut path_to_sprite = BTreeMap::<String, &EmoteStaticSprite>::new();
+    // Native DrawFrameInfo pointers are structural identities. Do not key the
+    // stencil graph by authored label paths: duplicate/empty labels are legal
+    // and can alias in a BTreeMap<String, ...>.
+    let mut key_to_sprite = BTreeMap::<Vec<u64>, &EmoteStaticSprite>::new();
     for sprite in &visible_sprites {
-        path_to_sprite.insert(sprite.draw_frame_info.path.clone(), *sprite);
+        key_to_sprite.insert(sprite.draw_frame_info.native_draw_key.clone(), *sprite);
     }
-
-    // mask_refs keys are OWNER paths read from `scene.composite_mask_owners`.
-    // Per sub_103390C0 second pass (lines 407-528), an owner is a layer with
-    // `stencilType & 4` set; its `stencilCompositeMaskLayerList` is a layer-
-    // local field consumed at THAT owner.  Descendants of the owner inherit a
-    // `parent_mask_path` pointing back at the owner — that is the linkage the
-    // renderer uses to sample the owner's alpha texture.  Inheritance of the
-    // source list through traversal context (the previous behavior) made
-    // descendants accidentally become mask owners themselves.
-    let mut mask_refs = BTreeMap::<String, u32>::new();
-    let mut next_mask_ref = 1u32;
-    for owner_path in scene.composite_mask_owners.keys() {
-        if mask_refs.contains_key(owner_path) {
-            continue;
-        }
-        mask_refs.insert(owner_path.clone(), next_mask_ref.min(255));
-        next_mask_ref = (next_mask_ref + 1).min(255);
-    }
+    let layer_infos: BTreeMap<Vec<u64>, &EmoteDrawFrameInfo> = scene
+        .layer_states
+        .iter()
+        .map(|state| (state.draw_frame_info.native_draw_key.clone(), &state.draw_frame_info))
+        .collect();
 
     let dump_enabled = !GPU_DRAW_DUMP_DONE.swap(true, Ordering::Relaxed)
         && std::env::var("ELUNA_DUMP_DRAWS")
@@ -2235,64 +2552,34 @@ fn build_scene_draws(
             .unwrap_or(true);
     if dump_enabled {
         eprintln!(
-            "eluna draw stream dump: sprites_in_scene={} visible={} mask_refs={}",
+            "eluna native draw stream: sprites_in_scene={} visible={} composite_owners={}",
             scene.sprites.len(),
-            path_to_sprite.len(),
-            mask_refs.len(),
+            visible_sprites.len(),
+            scene.composite_mask_owners.len(),
         );
-        for (path, reference) in &mask_refs {
-            eprintln!("  mask_ref[{reference}] -> {path}");
-        }
     }
 
     let mut draws = Vec::<GpuDraw>::new();
     let mut dump_rows = Vec::<DumpRow>::new();
-    // Phase 1: for every composite-mask owner, emit MaskGeneration draws from
-    // each resolved source path.  These draws are filtered out of the final
-    // color pass by the renderer (pass == MaskGeneration is skipped); the
-    // alpha they accumulate into the owner's per-reference texture is what
-    // descendant Filtered draws sample.
-    for (owner_path, references) in &scene.composite_mask_owners {
-        let Some(&ref_id) = mask_refs.get(owner_path) else {
-            continue;
-        };
-        for target_path in references {
-            let Some(mask_sprite) = path_to_sprite.get(target_path).copied() else {
-                continue;
-            };
-            push_gpu_draw(
-                device,
-                texture_slots,
-                &mut draws,
-                mask_sprite,
-                EmoteDrawPass::MaskGeneration,
-                ref_id,
-                0,
-            )?;
-            if dump_enabled {
-                dump_rows.push(DumpRow {
-                    gpu_index: draws.len() - 1,
-                    sprite: mask_sprite,
-                    pass: EmoteDrawPass::MaskGeneration,
-                    mask_reference: ref_id,
-                    parent_mask_reference: 0,
-                    is_mask_source: true,
-                    composite_owner: Some(owner_path.clone()),
-                });
-            }
-        }
-    }
-    // Phase 2: emit every visible sprite in drawFrameInfo order.  A sprite is
-    // a masked-color item if its `parent_mask_path` resolves to a known
-    // composite-mask owner.  The renderer iterates these in this exact order
-    // and routes them between the normal and masked pipelines.
     for sprite in visible_sprites {
-        let parent_mask_reference = sprite
-            .draw_frame_info
-            .parent_mask_path
-            .as_ref()
-            .and_then(|path| mask_refs.get(path).copied())
-            .unwrap_or(0);
+        // Type-3 items are stencil geometry. sub_103390C0 submits them so they
+        // can be reached through DrawFrameInfo+120, but the renderer does not
+        // emit them as ordinary color items.
+        if matches!(
+            sprite.draw_frame_info.pass,
+            EmoteDrawPass::MaskGeneration | EmoteDrawPass::StencilCompositeMask
+        ) {
+            continue;
+        }
+
+        let (groups, initial_reference, final_reference) = stencil_groups_for_sprite(
+            device,
+            texture_slots,
+            scene,
+            &key_to_sprite,
+            &layer_infos,
+            sprite,
+        )?;
         push_gpu_draw(
             device,
             texture_slots,
@@ -2300,109 +2587,51 @@ fn build_scene_draws(
             sprite,
             sprite.draw_frame_info.pass,
             0,
-            parent_mask_reference,
+            final_reference,
         )?;
+        let draw = draws.last_mut().expect("push_gpu_draw appended one item");
+        draw.stencil_groups = groups;
+        draw.stencil_initial_reference = initial_reference;
+        draw.stencil_final_reference = final_reference;
+
         if dump_enabled {
-            let is_mask_source = matches!(
-                sprite.draw_frame_info.pass,
-                EmoteDrawPass::MaskGeneration | EmoteDrawPass::StencilCompositeMask
-            );
             dump_rows.push(DumpRow {
                 gpu_index: draws.len() - 1,
                 sprite,
                 pass: sprite.draw_frame_info.pass,
                 mask_reference: 0,
-                parent_mask_reference,
-                is_mask_source,
-                composite_owner: None,
+                parent_mask_reference: final_reference,
+                is_mask_source: false,
+                composite_owner: sprite.draw_frame_info.stencil_parent_path.clone(),
             });
         }
     }
 
     if dump_enabled {
-        // Compute the actual color-pass render-order index for each entry: the
-        // renderer iterates self.draws in order, skips mask sources, and issues
-        // the remaining items via the color pipeline (normal or masked).  This
-        // mirrors the render flow in GpuState::render exactly.
-        let mut render_order = 0usize;
-        let mut color_pass_items = Vec::<&DumpRow>::new();
-        let mut mask_pass_items = Vec::<&DumpRow>::new();
-        let mut per_draw_render_order = vec![-1i32; dump_rows.len()];
-        for (i, row) in dump_rows.iter().enumerate() {
-            if row.is_mask_source {
-                mask_pass_items.push(row);
-            } else {
-                per_draw_render_order[i] = render_order as i32;
-                color_pass_items.push(row);
-                render_order += 1;
-            }
-        }
-        eprintln!(
-            "eluna pass classification: mask_pass_items={} color_pass_items={} total_gpu_draws={}",
-            mask_pass_items.len(),
-            color_pass_items.len(),
-            dump_rows.len(),
-        );
-        for (i, row) in dump_rows.iter().enumerate() {
-            dump_draw_row(row, per_draw_render_order[i]);
-        }
-        // Audit table: color-pass items in render order with drawFrameInfo
-        // index to verify the stream is monotonic in di.  Any non-monotonic
-        // step here would indicate that the GPU stream reorders relative to
-        // the original drawFrameInfo emission.
-        eprintln!("color pass order audit (render_index, drawFrameInfo_index, label):");
-        let mut last_di: Option<usize> = None;
+        eprintln!("eluna color pass order audit (native stencil chain):");
+        let mut last_di = None;
         let mut monotonic = true;
-        for row in &color_pass_items {
+        for row in &dump_rows {
             let di = row.sprite.draw_frame_info.draw_index;
-            let render_index = per_draw_render_order[row.gpu_index] as usize;
-            let monotonic_flag = match last_di {
-                Some(prev) if di < prev => {
-                    monotonic = false;
-                    "!REORDER"
-                }
-                _ => "ok",
-            };
+            if last_di.is_some_and(|prev| di < prev) {
+                monotonic = false;
+            }
+            let draw = &draws[row.gpu_index];
             eprintln!(
-                "  ro={:>3} di={:>3} parent_ref={:>3} {} label={:?}",
-                render_index,
+                "  ro={:>3} di={:>3} stencil={}=>{} groups={} label={:?}",
+                row.gpu_index,
                 di,
-                row.parent_mask_reference,
-                monotonic_flag,
+                draw.stencil_initial_reference,
+                draw.stencil_final_reference,
+                draw.stencil_groups.len(),
                 row.sprite.draw_frame_info.layer_label,
             );
             last_di = Some(di);
         }
         eprintln!(
             "color pass order audit: {}",
-            if monotonic {
-                "PASS: render order is monotonic in drawFrameInfo index"
-            } else {
-                "FAIL: render order is NOT monotonic"
-            }
+            if monotonic { "PASS" } else { "FAIL: drawFrameInfo reorder" }
         );
-        eprintln!("mask pass items grouped by reference:");
-        for (path, reference) in &mask_refs {
-            let sources: Vec<&DumpRow> = mask_pass_items
-                .iter()
-                .filter(|row| row.mask_reference == *reference)
-                .copied()
-                .collect();
-            eprintln!(
-                "  reference={} sources={} owner_path={}",
-                reference,
-                sources.len(),
-                path,
-            );
-            for row in &sources {
-                eprintln!(
-                    "    src di={:>3} label={:?} path={}",
-                    row.sprite.draw_frame_info.draw_index,
-                    row.sprite.draw_frame_info.layer_label,
-                    row.sprite.draw_frame_info.path,
-                );
-            }
-        }
     }
 
     let bounds = scene.bounds.unwrap_or(EmoteSceneBounds {
@@ -2514,14 +2743,18 @@ fn push_gpu_draw(
     mask_reference: u32,
     parent_mask_reference: u32,
 ) -> Result<(), Box<dyn Error>> {
-    let slot = *texture_slots
-        .get(&sprite.texture_resource_index)
-        .ok_or_else(|| {
-            IoError::new(
-                ErrorKind::InvalidData,
-                "texture resource index was not loaded",
-            )
-        })?;
+    let slot = if sprite.feedback_history {
+        0
+    } else {
+        *texture_slots
+            .get(&sprite.texture_resource_index)
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "texture resource index was not loaded",
+                )
+            })?
+    };
     let vertices = sprite_vertices(sprite);
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("eluna dynamic sprite vertices"),
@@ -2530,11 +2763,16 @@ fn push_gpu_draw(
     });
     draws.push(GpuDraw {
         texture_slot: slot,
+        feedback_history: sprite.feedback_history,
         vertex_buffer,
         vertex_count: vertices.len() as u32,
+        blend_mode: sprite.blend_mode,
         pass,
         mask_reference,
         parent_mask_reference,
+        stencil_groups: Vec::new(),
+        stencil_initial_reference: 0,
+        stencil_final_reference: 0,
     });
     Ok(())
 }
@@ -2563,11 +2801,16 @@ fn build_preview_draws(
         vec![texture],
         vec![GpuDraw {
             texture_slot: 0,
+            feedback_history: false,
             vertex_buffer,
             vertex_count: vertices.len() as u32,
+            blend_mode: 0x10,
             pass: EmoteDrawPass::Normal,
             mask_reference: 0,
             parent_mask_reference: 0,
+            stencil_groups: Vec::new(),
+            stencil_initial_reference: 0,
+            stencil_final_reference: 0,
         }],
         EmoteSceneBounds {
             min_x: -1.0,
@@ -2587,22 +2830,54 @@ fn sprite_vertices(sprite: &EmoteStaticSprite) -> Vec<GpuSpriteVertex> {
     let right = sprite.right();
     let top = sprite.top();
     let bottom = sprite.bottom();
-    let color = [1.0, 1.0, 1.0, sprite.opacity];
+    let tl_color = native_corner_color(sprite, sprite.corner_colors[0]);
+    let tr_color = native_corner_color(sprite, sprite.corner_colors[1]);
+    let bl_color = native_corner_color(sprite, sprite.corner_colors[2]);
+    let br_color = native_corner_color(sprite, sprite.corner_colors[3]);
 
-    let make = |position: [f32; 2], texcoord: [f32; 2]| GpuSpriteVertex {
+    let make = |position: [f32; 2], texcoord: [f32; 2], color: [f32; 4]| GpuSpriteVertex {
         position: transform_sprite_point(sprite, position),
         texcoord,
         color,
+        blend_mode: sprite.blend_mode as f32,
+        clip_rect: sprite.draw_frame_info.clip_rect.unwrap_or([-1.0e30, -1.0e30, 1.0e30, 1.0e30]),
+        wipe: [
+            sprite.draw_frame_info.stencil_wipe_scale,
+            sprite.draw_frame_info.stencil_wipe_bias,
+            if sprite.draw_frame_info.stencil_wipe_enabled { 1.0 } else { 0.0 },
+        ],
     };
 
     vec![
-        make([left, top], [sprite.uv_left, sprite.uv_top]),
-        make([left, bottom], [sprite.uv_left, sprite.uv_bottom]),
-        make([right, top], [sprite.uv_right, sprite.uv_top]),
-        make([right, top], [sprite.uv_right, sprite.uv_top]),
-        make([left, bottom], [sprite.uv_left, sprite.uv_bottom]),
-        make([right, bottom], [sprite.uv_right, sprite.uv_bottom]),
+        make([left, top], [sprite.uv_left, sprite.uv_top], tl_color),
+        make([left, bottom], [sprite.uv_left, sprite.uv_bottom], bl_color),
+        make([right, top], [sprite.uv_right, sprite.uv_top], tr_color),
+        make([right, top], [sprite.uv_right, sprite.uv_top], tr_color),
+        make([left, bottom], [sprite.uv_left, sprite.uv_bottom], bl_color),
+        make([right, bottom], [sprite.uv_right, sprite.uv_bottom], br_color),
     ]
+}
+
+fn native_corner_color(sprite: &EmoteStaticSprite, packed: u32) -> [f32; 4] {
+    // Frame colors are 0xRRGGBBAA. sub_1039DC70 multiplies only the low
+    // alpha byte by layer opacity.  bm high nibble 0x10 selects D3DTOP_MODULATE2X,
+    // so the neutral serialized RGB value is 0x80 rather than 0xFF.
+    let r = ((packed >> 24) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let b = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let a = (packed & 0xFF) as f32 / 255.0;
+    [r, g, b, (a * sprite.opacity).clamp(0.0, 1.0)]
+}
+
+fn bilerp_color(corners: [[f32; 4]; 4], u: f32, v: f32) -> [f32; 4] {
+    // Native corner order follows the rectangle: TL, TR, BL, BR.
+    let mut out = [0.0; 4];
+    for i in 0..4 {
+        let top = corners[0][i] + (corners[1][i] - corners[0][i]) * u;
+        let bottom = corners[2][i] + (corners[3][i] - corners[2][i]) * u;
+        out[i] = top + (bottom - top) * v;
+    }
+    out
 }
 
 fn transform_sprite_point(sprite: &EmoteStaticSprite, point: [f32; 2]) -> [f32; 2] {
@@ -2644,7 +2919,12 @@ fn mesh_sprite_vertices(
     let division_y = mesh.division_y.max(1) as usize;
     let left = sprite.left();
     let top = sprite.top();
-    let color = [1.0, 1.0, 1.0, sprite.opacity];
+    let corner_colors = [
+        native_corner_color(sprite, sprite.corner_colors[0]),
+        native_corner_color(sprite, sprite.corner_colors[1]),
+        native_corner_color(sprite, sprite.corner_colors[2]),
+        native_corner_color(sprite, sprite.corner_colors[3]),
+    ];
 
     let vertex_at = |ix: usize, iy: usize| -> GpuSpriteVertex {
         let u = ix as f32 / division_x as f32;
@@ -2657,7 +2937,14 @@ fn mesh_sprite_vertices(
                 sprite.uv_left + (sprite.uv_right - sprite.uv_left) * u,
                 sprite.uv_top + (sprite.uv_bottom - sprite.uv_top) * v,
             ],
-            color,
+            color: bilerp_color(corner_colors, u, v),
+            blend_mode: sprite.blend_mode as f32,
+            clip_rect: sprite.draw_frame_info.clip_rect.unwrap_or([-1.0e30, -1.0e30, 1.0e30, 1.0e30]),
+        wipe: [
+            sprite.draw_frame_info.stencil_wipe_scale,
+            sprite.draw_frame_info.stencil_wipe_bias,
+            if sprite.draw_frame_info.stencil_wipe_enabled { 1.0 } else { 0.0 },
+        ],
         }
     };
 
@@ -2735,35 +3022,9 @@ fn dump_gpu_frame(model: &LoadedModel, output_dir: &PathBuf) -> Result<(), Box<d
             },
         ],
     });
-    let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("eluna offscreen mask bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("eluna offscreen sprite shader"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-    });
-    let masked_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("eluna offscreen masked sprite shader"),
-        source: wgpu::ShaderSource::Wgsl(MASKED_SHADER.into()),
     });
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2771,44 +3032,47 @@ fn dump_gpu_frame(model: &LoadedModel, output_dir: &PathBuf) -> Result<(), Box<d
         bind_group_layouts: &[Some(&transform_bgl), Some(&texture_bgl)],
         immediate_size: 0,
     });
-    let masked_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("eluna offscreen masked sprite pipeline layout"),
-        bind_group_layouts: &[Some(&transform_bgl), Some(&texture_bgl), Some(&mask_bgl)],
-        immediate_size: 0,
-    });
 
-    let mask_format = wgpu::TextureFormat::Rgba8Unorm;
-    let pipeline = create_color_pipeline(
+    let stencil_format = wgpu::TextureFormat::Depth24PlusStencil8;
+    let pipelines = create_native_color_pipelines(
         &device,
         &pipeline_layout,
         &shader,
         target_format,
         "offscreen sprite",
     );
-    let mask_pipeline = create_color_pipeline(
+    let stencil_color_pipelines = create_native_stencil_color_pipelines(
         &device,
         &pipeline_layout,
         &shader,
-        mask_format,
-        "offscreen mask",
-    );
-    let masked_pipeline = create_color_pipeline(
-        &device,
-        &masked_pipeline_layout,
-        &masked_shader,
         target_format,
-        "offscreen masked",
+        stencil_format,
+        "offscreen stencil color",
     );
-    let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("offscreen mask sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-        ..Default::default()
-    });
+    let stencil_inner_pipeline = create_stencil_pipeline(
+        &device,
+        &pipeline_layout,
+        &shader,
+        target_format,
+        stencil_format,
+        None,
+        wgpu::CompareFunction::Equal,
+        wgpu::StencilOperation::IncrementWrap,
+        false,
+        "offscreen stencil inner",
+    );
+    let stencil_outer_pipeline = create_stencil_pipeline(
+        &device,
+        &pipeline_layout,
+        &shader,
+        target_format,
+        stencil_format,
+        None,
+        wgpu::CompareFunction::Equal,
+        wgpu::StencilOperation::DecrementWrap,
+        false,
+        "offscreen stencil outer",
+    );
 
     // Build atlases and draws using the same logic as the live renderer.
     let (textures, model_texture_slots, draws, bounds) = build_model_assets(
@@ -2874,85 +3138,25 @@ fn dump_gpu_frame(model: &LoadedModel, output_dir: &PathBuf) -> Result<(), Box<d
     });
     let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Build per-reference mask textures.
-    use std::collections::BTreeSet;
-    let needed_refs: BTreeSet<u32> = draws
-        .iter()
-        .filter(|d| d.parent_mask_reference != 0)
-        .map(|d| d.parent_mask_reference)
-        .collect();
-    let mut mask_targets = BTreeMap::<u32, MaskCacheEntry>::new();
-    for reference in needed_refs.iter().copied() {
-        let label = format!("offscreen mask #{reference}");
-        let (texture, view) = create_alpha_mask_target(&device, width, height, mask_format, &label);
-        let bind_group = create_alpha_mask_bind_group(
-            &device,
-            &mask_bgl,
-            &view,
-            &mask_sampler,
-            &format!("offscreen mask bg #{reference}"),
-        );
-        mask_targets.insert(
-            reference,
-            MaskCacheEntry {
-                _texture: texture,
-                view,
-                bind_group,
-            },
-        );
-    }
+    let (stencil_texture, stencil_view) = create_stencil_target(
+        &device,
+        width,
+        height,
+        stencil_format,
+        "eluna offscreen stencil",
+    );
+    let _stencil_texture = stencil_texture;
     let _ = model_texture_slots;
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("eluna offscreen encoder"),
     });
 
-    for reference in needed_refs.iter().copied() {
-        let entry = mask_targets.get(&reference).unwrap();
-        let mut mp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("offscreen mask pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &entry.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
-            multiview_mask: None,
-        });
-        mp.set_pipeline(&mask_pipeline);
-        mp.set_bind_group(0, &transform_bind_group, &[]);
-        for draw in &draws {
-            if draw.mask_reference != reference {
-                continue;
-            }
-            if draw.pass != EmoteDrawPass::MaskGeneration
-                && draw.pass != EmoteDrawPass::StencilCompositeMask
-            {
-                continue;
-            }
-            let Some(t) = textures.get(draw.texture_slot) else {
-                continue;
-            };
-            mp.set_bind_group(1, &t.bind_group, &[]);
-            mp.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-            mp.draw(0..draw.vertex_count, 0..1);
-        }
-    }
-
+    // Clear the color target once. Native stencil reconstruction is then
+    // performed independently for every color DrawFrameInfo item.
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("offscreen color pass"),
+        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offscreen color clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &color_view,
                 depth_slice: None,
@@ -2972,44 +3176,112 @@ fn dump_gpu_frame(model: &LoadedModel, output_dir: &PathBuf) -> Result<(), Box<d
             timestamp_writes: None,
             multiview_mask: None,
         });
-        #[derive(Copy, Clone, PartialEq, Eq)]
-        enum Mode {
-            None,
-            Color,
-            Masked,
+    }
+
+    for draw in &draws {
+        if draw.pass == EmoteDrawPass::MaskGeneration
+            || draw.pass == EmoteDrawPass::StencilCompositeMask
+            || draw.feedback_history
+        {
+            continue;
         }
-        let mut mode = Mode::None;
-        for draw in &draws {
-            if draw.pass == EmoteDrawPass::MaskGeneration
-                || draw.pass == EmoteDrawPass::StencilCompositeMask
-            {
-                continue;
-            }
-            let Some(t) = textures.get(draw.texture_slot) else {
-                continue;
-            };
-            if draw.parent_mask_reference != 0 {
-                let Some(m) = mask_targets.get(&draw.parent_mask_reference) else {
-                    continue;
-                };
-                if mode != Mode::Masked {
-                    pass.set_pipeline(&masked_pipeline);
-                    pass.set_bind_group(0, &transform_bind_group, &[]);
-                    mode = Mode::Masked;
-                }
-                pass.set_bind_group(2, &m.bind_group, &[]);
-                pass.set_bind_group(1, &t.bind_group, &[]);
-            } else {
-                if mode != Mode::Color {
-                    pass.set_pipeline(&pipeline);
-                    pass.set_bind_group(0, &transform_bind_group, &[]);
-                    mode = Mode::Color;
-                }
-                pass.set_bind_group(1, &t.bind_group, &[]);
-            }
+        let Some(texture) = textures.get(draw.texture_slot) else {
+            continue;
+        };
+        let blend_index = native_blend_index(draw.blend_mode);
+
+        if draw.stencil_groups.is_empty() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen native color item"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipelines[blend_index]);
+            pass.set_bind_group(0, &transform_bind_group, &[]);
+            pass.set_bind_group(1, &texture.bind_group, &[]);
             pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
             pass.draw(0..draw.vertex_count, 0..1);
+            continue;
         }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offscreen native stencil item"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &stencil_view,
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(draw.stencil_initial_reference),
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &transform_bind_group, &[]);
+
+        let mut reference = draw.stencil_initial_reference;
+        for group in draw.stencil_groups.iter().filter(|group| group.phase == 1) {
+            pass.set_pipeline(&stencil_inner_pipeline);
+            pass.set_stencil_reference(reference);
+            for source in &group.sources {
+                if source.feedback_history {
+                    continue;
+                }
+                let Some(mask_texture) = textures.get(source.texture_slot) else {
+                    continue;
+                };
+                pass.set_bind_group(1, &mask_texture.bind_group, &[]);
+                pass.set_vertex_buffer(0, source.vertex_buffer.slice(..));
+                pass.draw(0..source.vertex_count, 0..1);
+            }
+            reference = reference.saturating_add(1).min(255);
+        }
+
+        let final_reference = draw.stencil_final_reference;
+        if draw.stencil_groups.iter().any(|group| group.phase == 2) {
+            pass.set_pipeline(&stencil_outer_pipeline);
+            pass.set_stencil_reference(final_reference);
+            for group in draw.stencil_groups.iter().filter(|group| group.phase == 2) {
+                for source in &group.sources {
+                    if source.feedback_history {
+                        continue;
+                    }
+                    let Some(mask_texture) = textures.get(source.texture_slot) else {
+                        continue;
+                    };
+                    pass.set_bind_group(1, &mask_texture.bind_group, &[]);
+                    pass.set_vertex_buffer(0, source.vertex_buffer.slice(..));
+                    pass.draw(0..source.vertex_count, 0..1);
+                }
+            }
+        }
+
+        pass.set_pipeline(&stencil_color_pipelines[blend_index]);
+        pass.set_stencil_reference(final_reference);
+        pass.set_bind_group(1, &texture.bind_group, &[]);
+        pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+        pass.draw(0..draw.vertex_count, 0..1);
     }
 
     // Copy to readback buffer.  Rgba8 is 4 bytes/pixel; bytes_per_row must
@@ -3704,7 +3976,7 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
             .player
             .active_timelines()
             .iter()
-            .find(|(name, mode)| !name.starts_with("@control/") && !mode.is_difference())
+            .find(|(_, mode)| !mode.is_difference())
         {
             state.main_timeline = name.clone();
         }
@@ -3737,10 +4009,7 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
                             model.player.stop_timeline(&state.main_timeline);
                         }
                         state.main_timeline = name.clone();
-                        model.player.play_timeline(
-                            name,
-                            TimelinePlayMode::PARALLEL.with_looping(state.timeline_loop),
-                        );
+                        model.player.play_timeline(name, TimelinePlayMode::ONCE);
                         state.dirty = true;
                     }
                 }
@@ -3748,22 +4017,10 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
     });
 
     ui.horizontal(|ui| {
-        if ui
-            .checkbox(&mut state.timeline_loop, "Loop main locally")
-            .changed()
-        {
-            if !state.main_timeline.is_empty() {
-                let elapsed = model.player.timeline_elapsed_ticks(&state.main_timeline);
-                model.player.play_timeline(
-                    &state.main_timeline,
-                    TimelinePlayMode::PARALLEL.with_looping(state.timeline_loop),
-                );
-                let _ = model
-                    .player
-                    .set_timeline_time(&state.main_timeline, elapsed);
-                state.dirty = true;
-            }
-        }
+        // Native timeline looping is authored by loopBegin/loopEnd inside the
+        // model. A host-side "loop whole timeline" switch changes semantics,
+        // so the parity player deliberately does not override it.
+        ui.label("Loop: authored loopBegin/loopEnd");
         ui.label("Speed:");
         if ui
             .add(egui::Slider::new(&mut state.playback_speed, 0.0_f32..=4.0).step_by(0.05))
@@ -3793,7 +4050,6 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
                 .player
                 .active_timelines()
                 .iter()
-                .filter(|(name, _)| !name.starts_with("@control/"))
                 .map(|(name, mode)| (name.clone(), *mode))
                 .collect();
             for (name, mode) in active {
@@ -3868,7 +4124,6 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
         .player
         .active_timelines()
         .keys()
-        .filter(|name| !name.starts_with("@control/"))
         .cloned()
         .collect();
     for name in &active {
@@ -3927,6 +4182,39 @@ fn panel_motion(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState)
     ));
 }
 
+fn variable_runtime_range_note(player: &ElunaPlayer, name: &str) -> &'static str {
+    let pipeline = player.runtime_pipeline();
+    for control in &pipeline.physics_controls {
+        let def = match control {
+            PhysicsControl::Bust(def) | PhysicsControl::Hair(def) | PhysicsControl::Parts(def) => def,
+        };
+        if def.var_lr.as_deref() == Some(name)
+            || def.var_ud.as_deref() == Some(name)
+            || def.var_lrm.as_deref() == Some(name)
+        {
+            return "physics output · runtime solver domain (not an authored slider range)";
+        }
+    }
+    if pipeline
+        .mouth_controls
+        .iter()
+        .any(|control| control.talk_label == name)
+    {
+        return "mouth control input · no authored min/max";
+    }
+    if pipeline
+        .transition_controls
+        .iter()
+        .any(|control| control.label == name)
+    {
+        return "transition control · no authored min/max";
+    }
+    if pipeline.instant_variables.iter().any(|label| label == name) {
+        return "instant variable · no authored min/max";
+    }
+    "runtime/control variable · no authored min/max"
+}
+
 fn panel_variables(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState) {
     ui.horizontal(|ui| {
         ui.label("Filter:");
@@ -3969,12 +4257,12 @@ fn panel_variables(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiSta
                 (Some(value), Some(_)) | (Some(value), None) | (None, Some(value)) => (
                     value - 1.0,
                     value + 1.0,
-                    Some("single-key range: debug +/-1"),
+                    Some("single authored value · UI debug span +/-1"),
                 ),
                 (None, None) => (
                     value - 1.0,
                     value + 1.0,
-                    Some("unknown range: debug current +/-1"),
+                    Some(variable_runtime_range_note(&model.player, &name)),
                 ),
             };
             ui.horizontal(|ui| {
@@ -4086,7 +4374,7 @@ fn panel_face(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState) {
     if !pipeline.eye_controls.is_empty() {
         ui.heading("Eye Controls");
         for control in &pipeline.eye_controls {
-            let label = control.label.as_deref().unwrap_or("?");
+            let label = control.label.as_str();
             ui.label(format!("• {} enabled={}", label, control.enabled));
         }
         ui.separator();
@@ -4119,7 +4407,7 @@ fn panel_face(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState) {
         ui.separator();
         ui.heading("Eyebrow Controls");
         for control in &pipeline.eyebrow_controls {
-            let label = control.label.as_deref().unwrap_or("?");
+            let label = control.label.as_str();
             ui.label(format!("• {} enabled={}", label, control.enabled));
         }
         let eyebrow_vars: Vec<(String, f32, Option<f32>, Option<f32>)> = model
@@ -4150,7 +4438,7 @@ fn panel_face(ui: &mut egui::Ui, model: &mut LoadedModel, state: &mut UiState) {
         ui.separator();
         ui.heading("Mouth Controls");
         for control in &pipeline.mouth_controls {
-            let label = control.label.as_deref().unwrap_or("?");
+            let label = control.label.as_str();
             ui.label(format!("• {} enabled={}", label, control.enabled));
         }
         let mouth_vars: Vec<(String, f32, Option<f32>, Option<f32>)> = model

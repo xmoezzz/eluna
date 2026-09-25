@@ -9,6 +9,7 @@ use crate::{PsbFile, PsbValue};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::{Mutex, OnceLock};
 
@@ -99,6 +100,26 @@ pub struct EmoteMeshPatch {
     /// normalized local sprite space. The identity patch is
     /// `(col / 3, row / 3)`.
     pub control_points: [[f32; 2]; 16],
+}
+
+/// A mesh deformation and the coordinate frame in which its domain is authored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MeshChainEntry {
+    patch: EmoteMeshPatch,
+    transform: [f32; 6],
+}
+
+impl MeshChainEntry {
+    fn warp_world_point(&self, point: [f32; 2]) -> Option<[f32; 2]> {
+        let m = self.transform;
+        let inv = affine_inverse_linear(m)?;
+        let local = apply_linear4(inv, [point[0] - m[4], point[1] - m[5]]);
+        let warped = mesh_sync_warp_point(MeshSyncChildState {
+            patch: self.patch, mask: 1, coordinate: Some(0),
+        }, local)?;
+        let world = apply_linear4([m[0], m[1], m[2], m[3]], warped);
+        Some([world[0] + m[4], world[1] + m[5]])
+    }
 }
 
 impl EmoteMeshPatch {
@@ -457,7 +478,7 @@ pub struct EmoteStepFrameLayerState {
     /// nested/specialized consumers and Emote soft-body baseLayer lookup use
     /// this coordinate. It is rebuilt from `raw_position` after Anchor.
     pub position: [f32; 3],
-    pub(crate) mesh_chain: Vec<EmoteMeshPatch>,
+    pub(crate) mesh_chain: Vec<MeshChainEntry>,
     pub(crate) frame_offset: [f32; 2],
     /// Current decoded local frame, retained only for the native specialized
     /// pass sequence (Camera/Model/Particle/Feedback). It is intentionally not
@@ -823,11 +844,10 @@ impl Error for EmoteSchemaError {}
 
 impl EmoteModelSchema {
     pub fn from_psb(psb: &PsbFile) -> Result<Self, EmoteSchemaError> {
-        let root = psb
-            .root
+        let root_value = &psb.root;
+        root_value
             .as_object()
             .ok_or(EmoteSchemaError::RootIsNotObject)?;
-        let root_value = PsbValue::Object(root.to_vec());
         let object = root_value
             .field("object")
             .ok_or(EmoteSchemaError::MissingObjectTable)?;
@@ -856,11 +876,10 @@ impl EmoteModelSchema {
     }
 
     pub fn motion_infos(&self, psb: &PsbFile) -> Result<Vec<EmoteMotionInfo>, EmoteSchemaError> {
-        let root = psb
-            .root
+        let root_value = &psb.root;
+        root_value
             .as_object()
             .ok_or(EmoteSchemaError::RootIsNotObject)?;
-        let root_value = PsbValue::Object(root.to_vec());
         let object_table = root_value
             .field("object")
             .ok_or(EmoteSchemaError::MissingObjectTable)?;
@@ -1017,11 +1036,10 @@ impl EmoteModelSchema {
         previous_scene: Option<&EmoteStaticScene>,
         ground_correction_hook: Option<EmoteGroundCorrectionHook>,
     ) -> Result<EmoteStaticScene, EmoteSchemaError> {
-        let root = psb
-            .root
+        let root_value = &psb.root;
+        root_value
             .as_object()
             .ok_or(EmoteSchemaError::RootIsNotObject)?;
-        let root_value = PsbValue::Object(root.to_vec());
         let object_table = root_value
             .field("object")
             .ok_or(EmoteSchemaError::MissingObjectTable)?;
@@ -1039,6 +1057,7 @@ impl EmoteModelSchema {
             .ok_or(EmoteSchemaError::MissingBaseObject)?;
 
         let effective_time = effective_motion_time(motion, time_ticks);
+        let priority_ranks = Arc::new(motion_priority_ranks(motion, effective_time));
         let mut sprites = Vec::new();
         let mut layer_states = Vec::new();
         let mut frame_runtime_states = BTreeMap::<String, DynamicFrameState>::new();
@@ -1075,7 +1094,7 @@ impl EmoteModelSchema {
                 effective_time,
                 TravelContext {
                     draw_index: index,
-                    priority_ranks: motion_priority_ranks(motion, effective_time),
+                    priority_ranks: priority_ranks.clone(),
                     ..TravelContext::default()
                 },
                 previous_positions,
@@ -1215,11 +1234,10 @@ impl EmoteModelSchema {
     }
 
     pub fn build_static_scene(&self, psb: &PsbFile) -> Result<EmoteStaticScene, EmoteSchemaError> {
-        let root = psb
-            .root
+        let root_value = &psb.root;
+        root_value
             .as_object()
             .ok_or(EmoteSchemaError::RootIsNotObject)?;
-        let root_value = PsbValue::Object(root.to_vec());
         let object_table = root_value
             .field("object")
             .ok_or(EmoteSchemaError::MissingObjectTable)?;
@@ -1237,7 +1255,10 @@ impl EmoteModelSchema {
         if let Some(motions) = motion_table.as_object() {
             for (motion_name, motion) in motions {
                 if let Some(layers) = motion.field("layer").and_then(PsbValue::as_list) {
-                    let ctx = TravelContext::default();
+                    let ctx = TravelContext {
+                        priority_ranks: Arc::new(motion_priority_ranks(motion, 0.0)),
+                        ..TravelContext::default()
+                    };
                     for (index, layer) in layers.iter().enumerate() {
                         travel_layer(
                             layer,
@@ -1247,7 +1268,6 @@ impl EmoteModelSchema {
                             motion_name,
                             TravelContext {
                                 draw_index: index,
-                                priority_ranks: motion_priority_ranks(motion, 0.0),
                                 ..ctx.clone()
                             },
                             &mut sprites,
@@ -1896,7 +1916,9 @@ struct TravelContext {
     native_draw_prefix: Vec<u64>,
     native_draw_key: Vec<u64>,
     draw_index: usize,
-    priority_ranks: BTreeMap<String, usize>,
+    // All layers in one motion read the same priority table. Context clones
+    // must not copy the entire table for every node in the layer tree.
+    priority_ranks: Arc<BTreeMap<String, usize>>,
     layer_type: i64,
     mesh_transform: i64,
     mesh_combine: bool,
@@ -1927,7 +1949,7 @@ struct TravelContext {
     mesh_patch: Option<EmoteMeshPatch>,
     /// Active ancestor mesh-transform patches used by StepFrameMeshChain. The
     /// current layer's own mesh transform is appended only for descendants.
-    mesh_chain: Vec<EmoteMeshPatch>,
+    mesh_chain: Arc<Vec<MeshChainEntry>>,
     /// Start of the native meshCombine-collapse suffix in `mesh_chain` for the
     /// next child. StepFrameMeshChain walks the real parent chain upward and,
     /// when the child is an active `meshCombine` node, folds active meshes
@@ -1936,7 +1958,7 @@ struct TravelContext {
     /// the flattened traversal reproduce layerInfo+706/+708 without retaining
     /// raw native pointers.
     mesh_combine_candidate_start: usize,
-    mesh_parameters: BTreeSet<String>,
+    mesh_parameters: Arc<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1983,7 +2005,7 @@ impl Default for TravelContext {
             native_draw_prefix: Vec::new(),
             native_draw_key: Vec::new(),
             draw_index: 0,
-            priority_ranks: BTreeMap::new(),
+            priority_ranks: Arc::default(),
             layer_type: 0,
             mesh_transform: 0,
             mesh_combine: false,
@@ -2012,9 +2034,9 @@ impl Default for TravelContext {
             mesh_division_x: 1,
             mesh_division_y: 1,
             mesh_patch: None,
-            mesh_chain: Vec::new(),
+            mesh_chain: Arc::default(),
             mesh_combine_candidate_start: 0,
-            mesh_parameters: BTreeSet::new(),
+            mesh_parameters: Arc::default(),
         }
     }
 }
@@ -2224,7 +2246,7 @@ fn parse_screen_bounds(layer: &PsbValue) -> Option<[f32; 4]> {
     ])
 }
 
-fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameInfo {
+fn draw_frame_info(label: Option<String>, ctx: &TravelContext) -> EmoteDrawFrameInfo {
     let mesh_sync_child_mask = ctx.mesh_sync_child;
     let inherit_mask = ctx.inherit_mask.unwrap_or(0);
     let stencil_phase = ctx.stencil_type & 0x3;
@@ -2242,9 +2264,9 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
     };
     EmoteDrawFrameInfo {
         layer_label: label,
-        native_draw_key: ctx.native_draw_key,
+        native_draw_key: ctx.native_draw_key.clone(),
         draw_index: ctx.draw_index,
-        path: ctx.path,
+        path: ctx.path.clone(),
         layer_type: ctx.layer_type,
         ready_to_draw: ctx.ready_to_draw,
         submitted_to_draw_frame: ctx.ready_to_draw,
@@ -2261,7 +2283,7 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
         inherit_opacity: (inherit_mask & (1 << 10)) != 0,
         inherit_shape: (inherit_mask & (1 << 25)) != 0,
         inherit_angle: (inherit_mask & (1 << 4)) != 0,
-        transform_order: ctx.transform_order,
+        transform_order: ctx.transform_order.clone(),
         coordinate: ctx.coordinate,
         ground_correction: ctx.ground_correction,
         obj_tri_priority: ctx.obj_tri_priority,
@@ -2273,12 +2295,12 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
         stencil_wipe_reverse: ctx.stencil_wipe_reverse,
         stencil_wipe_scale: ctx.stencil_wipe_scale,
         stencil_wipe_bias: ctx.stencil_wipe_bias,
-        stencil_composite_mask_layer_list: ctx.stencil_composite_mask_layer_list,
+        stencil_composite_mask_layer_list: ctx.stencil_composite_mask_layer_list.clone(),
         stencil_composite_target_paths: Vec::new(),
-        parent_mask_path: ctx.parent_mask_path,
+        parent_mask_path: ctx.parent_mask_path.clone(),
         stencil_parent_path: None,
         stencil_parent_native_key: None,
-        control_parameter: ctx.control_parameter,
+        control_parameter: ctx.control_parameter.clone(),
         control_value: ctx.control_value,
         local_time_ticks: ctx.local_time_ticks,
         frame_index: ctx.frame_index,
@@ -2289,7 +2311,7 @@ fn draw_frame_info(label: Option<String>, ctx: TravelContext) -> EmoteDrawFrameI
 }
 
 fn layer_state_from_ctx(label: Option<String>, ctx: &TravelContext) -> EmoteStepFrameLayerState {
-    let info = draw_frame_info(label, ctx.clone());
+    let info = draw_frame_info(label, ctx);
     let raw_position = ctx.base_location.unwrap_or([0.0; 3]);
     EmoteStepFrameLayerState {
         path: ctx.path.clone(),
@@ -2297,7 +2319,7 @@ fn layer_state_from_ctx(label: Option<String>, ctx: &TravelContext) -> EmoteStep
         motion_scope_root_path: ctx.motion_scope_root_path.clone(),
         raw_position,
         position: raw_position,
-        mesh_chain: ctx.mesh_chain.clone(),
+        mesh_chain: ctx.mesh_chain.as_ref().clone(),
         frame_offset: ctx.frame_offset,
         specialized_frame: None,
         transform: ctx.transform.as_array(),
@@ -2326,10 +2348,10 @@ fn travel_layer(
     layer_states: &mut Vec<EmoteStepFrameLayerState>,
     mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
-    let Some(fields) = value.as_object() else {
+    let Some(_) = value.as_object() else {
         return Ok(());
     };
-    let layer = PsbValue::Object(fields.to_vec());
+    let layer = value;
 
     ctx = enter_layer_context(ctx, &layer, sibling_index);
     let label = layer.field_str("label").map(str::to_owned);
@@ -2367,15 +2389,14 @@ fn travel_layer(
         prepare_child_inherit_source(&mut ctx, None);
 
         for frame in frame_list {
-            let Some(frame_obj) = frame.as_object() else {
+            let Some(_) = frame.as_object() else {
                 continue;
             };
-            let frame_value = PsbValue::Object(frame_obj.to_vec());
-            let Some(content_fields) = frame_value.field("content").and_then(PsbValue::as_object)
+            let frame_value = frame;
+            let Some(content) = frame_value.field("content").filter(|v| v.as_object().is_some())
             else {
                 continue;
             };
-            let content = PsbValue::Object(content_fields.to_vec());
             let Some(src) = content.field_str("src").filter(|s| !s.is_empty()) else {
                 continue;
             };
@@ -2547,7 +2568,7 @@ fn recurse_motion(
         .and_then(|object| object.field("motion"))
         .and_then(|motion| motion.field(motion_name));
     let priority_ranks = motion
-        .map(|m| motion_priority_ranks(m, 0.0))
+        .map(|m| Arc::new(motion_priority_ranks(m, 0.0)))
         .unwrap_or_default();
     // sub_103390C0 recursively emits a nested MMotionPlayer exactly at the
     // parent type-3/type-4 priority slot. Preserve that slot as a lexicographic
@@ -3014,7 +3035,7 @@ fn build_sprite(
         uv_right: (icon.left + width) / texture.width as f32,
         uv_bottom: (icon.top + height) / texture.height as f32,
         mesh: ctx.mesh_patch,
-        draw_frame_info: draw_frame_info(label, ctx),
+        draw_frame_info: draw_frame_info(label, &ctx),
     })
 }
 
@@ -4441,14 +4462,19 @@ fn merge_frame_content(state: &mut DynamicFrameState, content: &PsbValue) {
 
 fn parse_mesh_domain_icon(icon: &str) -> Option<[f32; 4]> {
     let mut parts = icon.split(':');
-    let x = parts.next()?.parse::<f32>().ok()?;
-    let y = parts.next()?.parse::<f32>().ok()?;
-    let half_w = parts.next()?.parse::<f32>().ok()?;
-    let half_h = parts.next()?.parse::<f32>().ok()?;
-    if parts.next().is_some() || half_w <= 0.0 || half_h <= 0.0 {
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    let origin_x = parts.next()?.parse::<f32>().ok()?;
+    let origin_y = parts.next()?.parse::<f32>().ok()?;
+    if parts.next().is_some()
+        || ![width, height, origin_x, origin_y].iter().all(|v| v.is_finite())
+        || width <= 0.0 || height <= 0.0
+    {
         return None;
     }
-    Some([x - half_w, y - half_h, half_w * 2.0, half_h * 2.0])
+    // Mesh icons encode width:height:origin_x:origin_y, like ordinary
+    // sprite dimensions and origins. The origin need not be at the center.
+    Some([-origin_x, -origin_y, width, height])
 }
 
 #[derive(Debug, Clone)]
@@ -4699,10 +4725,10 @@ fn travel_layer_at(
     layer_states: &mut Vec<EmoteStepFrameLayerState>,
     mask_owners: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), EmoteSchemaError> {
-    let Some(fields) = value.as_object() else {
+    let Some(_) = value.as_object() else {
         return Ok(());
     };
-    let layer = PsbValue::Object(fields.to_vec());
+    let layer = value;
 
     ctx = enter_layer_context(ctx, &layer, sibling_index);
     // sub_1034D900/sub_103A20E0: every joinTarget layer consumes the next
@@ -4739,6 +4765,7 @@ fn travel_layer_at(
         ctx.mesh_division_x,
         ctx.mesh_division_y,
     );
+    let mut local_mesh_patch = None;
     let mut draw_ctx = ctx.clone();
     let mut child_ctx = ctx.clone();
     let sync_child_shape = (ctx.mesh_sync_child & 0x8) != 0;
@@ -4758,11 +4785,12 @@ fn travel_layer_at(
     }
     if let Some(mesh_combinator) = mesh_combinator {
         if let Some(patch) = mesh_combinator.self_patch {
+            local_mesh_patch = combine_patch(local_mesh_patch, patch);
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), patch);
             if sync_child_shape {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
                 if let Some(id) = &layer_mesh_parameter {
-                    child_ctx.mesh_parameters.insert(id.clone());
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
                 }
             }
         }
@@ -4770,7 +4798,7 @@ fn travel_layer_at(
             if let Some(patch) = mesh_combinator.child_patch {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
                 if let Some(id) = &layer_mesh_parameter {
-                    child_ctx.mesh_parameters.insert(id.clone());
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
                 }
             }
         }
@@ -4841,11 +4869,12 @@ fn travel_layer_at(
                 domain: mesh.domain,
                 control_points: mesh.control_points,
             };
+            local_mesh_patch = combine_patch(local_mesh_patch, mesh);
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), mesh);
             if sync_child_shape {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), mesh);
                 if let Some(id) = &layer_mesh_parameter {
-                    child_ctx.mesh_parameters.insert(id.clone());
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
                 }
             }
         }
@@ -5021,7 +5050,12 @@ fn travel_layer_at(
     let native_mesh_chain_active =
         ctx.mesh_transform == 1 && (ctx.mesh_sync_child & 0x8) != 0;
     let native_mesh_chain_patch = if native_mesh_chain_active {
-        draw_ctx.mesh_patch.filter(|patch| patch.domain.is_some())
+        // The chain already contains ancestor patches. Adding the cumulative
+        // drawable patch here would apply those deformations a second time.
+        local_mesh_patch.filter(|patch| patch.domain.is_some()).map(|patch| MeshChainEntry {
+            patch,
+            transform: draw_ctx.transform.as_array(),
+        })
     } else {
         None
     };
@@ -5235,7 +5269,7 @@ fn apply_motion_layer_inherit(
     let Some(target_parameters) = target_motion_parameter_ids(object_table, object_name, motion_name)
     else {
         ctx.mesh_patch = None;
-        ctx.mesh_parameters.clear();
+        ctx.mesh_parameters = Arc::default();
         return;
     };
     let shared_parameter_count = target_parameters
@@ -5244,7 +5278,7 @@ fn apply_motion_layer_inherit(
         .count();
     if shared_parameter_count < 4 {
         ctx.mesh_patch = None;
-        ctx.mesh_parameters.clear();
+        ctx.mesh_parameters = Arc::default();
     }
 }
 
@@ -5509,10 +5543,10 @@ fn apply_anchor_specialized_pass(
 
 
 fn advance_native_mesh_combine_chain(
-    chain: &mut Vec<EmoteMeshPatch>,
+    chain: &mut Arc<Vec<MeshChainEntry>>,
     child_candidate_start: &mut usize,
     current_candidate_start: usize,
-    current_patch: Option<EmoteMeshPatch>,
+    current_patch: Option<MeshChainEntry>,
     current_active: bool,
     current_mesh_combine: bool,
 ) {
@@ -5537,12 +5571,18 @@ fn advance_native_mesh_combine_chain(
     if current_active {
         if let Some(mut patch) = current_patch {
             if current_mesh_combine {
-                for ancestor in chain.iter().skip(start) {
-                    patch = patch.combined_with(ancestor);
+                // Displacement addition is valid only in the same coordinate
+                // frame and domain. Keep other ancestors as separate mappings.
+                let combine_start = chain.iter().enumerate().skip(start)
+                    .rfind(|(_, ancestor)| ancestor.transform != patch.transform
+                        || ancestor.patch.domain != patch.patch.domain)
+                    .map_or(start, |(index, _)| index + 1);
+                for ancestor in chain.iter().skip(combine_start) {
+                    patch.patch = patch.patch.combined_with(&ancestor.patch);
                 }
-                chain.truncate(start);
+                Arc::make_mut(chain).truncate(combine_start);
             }
-            chain.push(patch);
+            Arc::make_mut(chain).push(patch);
             appended_current = true;
         }
     }
@@ -5603,13 +5643,8 @@ fn apply_mesh_chain_specialized_pass(
             continue;
         }
         let mut xy = [state.raw_position[0], state.raw_position[1]];
-        for patch in state.mesh_chain.iter().rev() {
-            let sync = MeshSyncChildState {
-                patch: *patch,
-                mask: 1,
-                coordinate: Some(0),
-            };
-            if let Some(mapped) = mesh_sync_warp_point(sync, xy) {
+        for entry in state.mesh_chain.iter().rev() {
+            if let Some(mapped) = entry.warp_world_point(xy) {
                 xy = mapped;
             }
         }
@@ -5664,33 +5699,13 @@ fn apply_ready_to_draw_specialized_pass(
     // type 12 applies the native wipe scale/bias range gate.
     let end = scope_end.min(layer_states.len());
     let begin = scope_start.min(end);
-    let mut ready_by_index = BTreeMap::<String, bool>::new();
-    // Portable copy of LayerInfo+724: this deliberately stores the nearest
-    // READY LayerInfo even when that helper LayerInfo has no DrawFrameInfo.
-    // Native sub_1035A660 does not skip through such helpers. The key is the
-    // player-local structural index path, never the authored label path.
-    let mut owner_by_index = BTreeMap::<String, Option<(String, i64, Vec<u64>)>>::new();
-    let mut path_by_index = BTreeMap::<String, String>::new();
-    let mut layer_type_by_index = BTreeMap::<String, i64>::new();
-    let mut draw_key_by_index = BTreeMap::<String, Vec<u64>>::new();
-
+    // For each structural index, retain its nearest ready ancestor (including
+    // itself). Borrow the stable paths/keys rather than copying five maps of
+    // layer metadata on each of the three scene evaluations per host frame.
+    let mut ready_ancestors = BTreeMap::<&str, Option<(&str, i64, &[u64])>>::new();
     for state in layer_states[begin..end].iter_mut() {
-        let parent_index = state
-            .scope_index_path
-            .rsplit_once('/')
-            .map(|(parent, _)| parent.to_owned());
-        let parent_owner = parent_index.as_ref().and_then(|parent| {
-            if ready_by_index.get(parent).copied().unwrap_or(false) {
-                path_by_index
-                    .get(parent)
-                    .cloned()
-                    .zip(layer_type_by_index.get(parent).copied())
-                    .zip(draw_key_by_index.get(parent).cloned())
-                    .map(|((path, layer_type), draw_key)| (path, layer_type, draw_key))
-            } else {
-                owner_by_index.get(parent).cloned().flatten()
-            }
-        });
+        let parent_owner = state.scope_index_path.rsplit_once('/')
+            .and_then(|(parent, _)| ready_ancestors.get(parent).copied().flatten());
 
         // sub_103390C0 writes DrawFrameInfo+120 as
         //     layer+724 ? (layer+724)->+732 : NULL
@@ -5702,11 +5717,11 @@ fn apply_ready_to_draw_specialized_pass(
         state.draw_frame_info.stencil_parent_path = parent_owner
             .as_ref()
             .filter(|(_, layer_type, _)| native_layer_has_draw_frame_info(*layer_type))
-            .map(|(path, _, _)| path.clone());
+            .map(|(path, _, _)| (*path).to_owned());
         state.draw_frame_info.stencil_parent_native_key = parent_owner
             .as_ref()
             .filter(|(_, layer_type, _)| native_layer_has_draw_frame_info(*layer_type))
-            .map(|(_, _, draw_key)| draw_key.clone());
+            .map(|(_, _, draw_key)| draw_key.to_vec());
 
         // Native StepFrameReadyToDraw begins at LayerInfo index 1 because
         // LayerInfo[0] is the synthetic MMotionPlayer root. `layer_states` does
@@ -5753,16 +5768,14 @@ fn apply_ready_to_draw_specialized_pass(
             };
         }
         state.draw_frame_info.stencil_phase = phase;
-        ready_by_index.insert(state.scope_index_path.clone(), ready);
-        owner_by_index.insert(state.scope_index_path.clone(), parent_owner);
-        path_by_index.insert(state.scope_index_path.clone(), state.path.clone());
-        layer_type_by_index.insert(
-            state.scope_index_path.clone(),
-            state.draw_frame_info.layer_type,
-        );
-        draw_key_by_index.insert(
-            state.scope_index_path.clone(),
-            state.draw_frame_info.native_draw_key.clone(),
+        ready_ancestors.insert(
+            &state.scope_index_path,
+            if ready {
+                Some((&state.path, state.draw_frame_info.layer_type,
+                      &state.draw_frame_info.native_draw_key))
+            } else {
+                parent_owner
+            },
         );
     }
 
@@ -5770,12 +5783,12 @@ fn apply_ready_to_draw_specialized_pass(
     // by the human-readable label path. Duplicate/empty authored labels can
     // produce identical display paths but never identical LayerInfo priority
     // identities inside one recursive draw stream.
-    let infos: BTreeMap<Vec<u64>, EmoteDrawFrameInfo> = layer_states[begin..end]
+    let infos: BTreeMap<&[u64], &EmoteDrawFrameInfo> = layer_states[begin..end]
         .iter()
-        .map(|state| (state.draw_frame_info.native_draw_key.clone(), state.draw_frame_info.clone()))
+        .map(|state| (state.draw_frame_info.native_draw_key.as_slice(), &state.draw_frame_info))
         .collect();
     for sprite in sprites.iter_mut().skip(sprite_scope_start) {
-        if let Some(info) = infos.get(&sprite.draw_frame_info.native_draw_key) {
+        if let Some(info) = infos.get(sprite.draw_frame_info.native_draw_key.as_slice()) {
             sprite.draw_frame_info.ready_to_draw = info.ready_to_draw;
             sprite.draw_frame_info.submitted_to_draw_frame = info.submitted_to_draw_frame;
             sprite.draw_frame_info.stencil_parent_path = info.stencil_parent_path.clone();
@@ -5925,7 +5938,20 @@ fn apply_model_specialized_pass(
     // is host-specific, but the model clock and all three native direction
     // modes are pure MMotionPlayer state and must be resolved here.
     let end = scope_end.min(layer_states.len());
-    let snapshot = layer_states[scope_start.min(end)..end].to_vec();
+    let scope = &layer_states[scope_start.min(end)..end];
+    // Only target-directed 3-D models read other layers. Ordinary 2-D
+    // character scopes must not clone every layer for an unused snapshot.
+    let snapshot = if scope.iter().any(|state| {
+        state.draw_frame_info.layer_type == 6
+            && state.visible
+            && state.specialized_frame.as_ref()
+                .and_then(|frame| frame.model.as_ref())
+                .is_some_and(|model| model.direction_type == 4)
+    }) {
+        scope.to_vec()
+    } else {
+        Vec::new()
+    };
     for state in layer_states.iter_mut().take(end).skip(scope_start) {
         if state.draw_frame_info.layer_type != 6 || !state.visible {
             state.model_runtime = None;
@@ -6413,7 +6439,7 @@ fn particle_child_context(
     };
     ctx.inherit_source = root;
     ctx.motion_root = root;
-    ctx.mesh_chain = emitter.mesh_chain.clone();
+    ctx.mesh_chain = Arc::new(emitter.mesh_chain.clone());
     ctx.parent_mask_path = emitter.draw_frame_info.parent_mask_path.clone();
     ctx
 }
@@ -6467,7 +6493,7 @@ fn apply_particle_specialized_pass(
     let mut cursor = 0usize;
     let mut processed = BTreeSet::<String>::new();
     while cursor < layer_states.len() {
-        let emitter = layer_states[cursor].clone();
+        let emitter = &layer_states[cursor];
         cursor += 1;
         let Some(config) = emitter.particle_static.clone() else {
             continue;
@@ -6478,6 +6504,8 @@ fn apply_particle_specialized_pass(
         let Some(frame) = emitter.specialized_frame.as_ref().and_then(|state| state.particle) else {
             continue;
         };
+        // Recurse below may append layers; own only actual emitter state.
+        let emitter = emitter.clone();
         let angle = particle_emitter_angle_degrees(emitter.transform);
         let runtime = emitters
             .entry(emitter.path.clone())
@@ -6855,7 +6883,7 @@ fn recurse_motion_at(
         .and_then(PsbValue::as_list)
         .or(parameter_table);
     let effective_time = effective_motion_time(motion, time_ticks);
-    let priority_ranks = motion_priority_ranks(motion, effective_time);
+    let priority_ranks = Arc::new(motion_priority_ranks(motion, effective_time));
     let scope_start = layer_states.len();
     let sprite_scope_start = out.len();
     let mut pending_nested = Vec::new();
@@ -7129,6 +7157,31 @@ fn decode_raw_mesh_list(raw: &[u8], mesh_count: usize, is_delta: bool) -> Option
 mod tests {
     use super::*;
 
+    #[test]
+    fn mesh_icon_dimensions_and_off_center_origin_define_local_domain() {
+        assert_eq!(parse_mesh_domain_icon("701:1316:350:658"),
+            Some([-350.0, -658.0, 701.0, 1316.0]));
+        assert_eq!(parse_mesh_domain_icon("100:80:0:20"),
+            Some([0.0, -20.0, 100.0, 80.0]));
+        assert_eq!(parse_mesh_domain_icon("0:80:0:20"), None);
+        assert_eq!(parse_mesh_domain_icon("NaN:80:0:20"), None);
+    }
+
+    #[test]
+    fn mesh_chain_warps_in_owner_space_under_rotation_scale_and_translation() {
+        let mut patch = EmoteMeshPatch::identity(1, 1);
+        patch.domain = Some([-50.0, -40.0, 100.0, 80.0]);
+        // A uniform local displacement of (10, 0).
+        for point in &mut patch.control_points { point[0] += 0.1; }
+        let entry = MeshChainEntry {
+            patch,
+            transform: [0.0, -2.0, 2.0, 0.0, 300.0, -700.0],
+        };
+        let result = entry.warp_world_point([300.0, -700.0]).unwrap();
+        assert!((result[0] - 300.0).abs() < 0.001);
+        assert!((result[1] + 680.0).abs() < 0.001);
+    }
+
     fn test_layer(label: &str, children: Vec<PsbValue>) -> PsbValue {
         let mut fields = vec![("label".to_owned(), PsbValue::String(label.to_owned()))];
         if !children.is_empty() {
@@ -7207,7 +7260,7 @@ mod tests {
             uv_right: 1.0,
             uv_bottom: 1.0,
             mesh: None,
-            draw_frame_info: draw_frame_info(Some(label.to_owned()), ctx),
+            draw_frame_info: draw_frame_info(Some(label.to_owned()), &ctx),
         }
     }
 
@@ -7353,6 +7406,7 @@ mod tests {
         let mut ranks = BTreeMap::new();
         ranks.insert("0".to_owned(), 7usize);
         ranks.insert("0/0".to_owned(), 1usize);
+        let ranks = Arc::new(ranks);
         let parent = enter_layer_context(
             TravelContext {
                 priority_ranks: ranks.clone(),
@@ -7382,7 +7436,7 @@ mod tests {
         let child = enter_layer_context(
             TravelContext {
                 native_draw_prefix: vec![5],
-                priority_ranks: child_ranks,
+                priority_ranks: Arc::new(child_ranks),
                 ..TravelContext::default()
             },
             &test_layer("Child", vec![]),
@@ -7414,19 +7468,19 @@ mod tests {
         }
     }
 
-    fn test_mesh_patch(dx: f32, dy: f32) -> EmoteMeshPatch {
+    fn test_mesh_patch(dx: f32, dy: f32) -> MeshChainEntry {
         let mut patch = EmoteMeshPatch::identity(1, 1);
         patch.domain = Some([-1.0, -1.0, 1.0, 1.0]);
         patch.control_points[5][0] += dx;
         patch.control_points[5][1] += dy;
-        patch
+        MeshChainEntry { patch, transform: EmoteTransform2D::identity().as_array() }
     }
 
     #[test]
     fn native_mesh_combine_collapses_inclusive_noncombining_active_parent() {
         let parent = test_mesh_patch(0.10, 0.20);
         let child = test_mesh_patch(0.30, -0.10);
-        let mut chain = Vec::new();
+        let mut chain = Arc::new(Vec::new());
         let mut candidate = 0usize;
 
         // Active parent with meshCombine=false: it is the inclusive stop node
@@ -7453,15 +7507,15 @@ mod tests {
         );
         assert_eq!(chain.len(), 1);
         let identity = EmoteMeshPatch::identity(1, 1);
-        assert!((chain[0].control_points[5][0] - (identity.control_points[5][0] + 0.40)).abs() < 1.0e-6);
-        assert!((chain[0].control_points[5][1] - (identity.control_points[5][1] + 0.10)).abs() < 1.0e-6);
+        assert!((chain[0].patch.control_points[5][0] - (identity.control_points[5][0] + 0.40)).abs() < 1.0e-6);
+        assert!((chain[0].patch.control_points[5][1] - (identity.control_points[5][1] + 0.10)).abs() < 1.0e-6);
     }
 
     #[test]
     fn native_mesh_combine_inactive_false_parent_is_a_hard_barrier() {
         let older = test_mesh_patch(0.10, 0.0);
         let current = test_mesh_patch(0.30, 0.0);
-        let mut chain = vec![older];
+        let mut chain = Arc::new(vec![older]);
         let mut candidate = 0usize;
 
         // An inactive meshTransform with meshCombine=false causes the native
@@ -7492,7 +7546,7 @@ mod tests {
     fn native_mesh_combine_inactive_true_parent_preserves_parent_walk() {
         let older = test_mesh_patch(0.10, 0.0);
         let current = test_mesh_patch(0.30, 0.0);
-        let mut chain = vec![older];
+        let mut chain = Arc::new(vec![older]);
         let mut candidate = 0usize;
 
         // meshCombine=true with no active mesh is transparent: native keeps
@@ -7518,7 +7572,7 @@ mod tests {
         );
         assert_eq!(chain.len(), 1);
         let identity = EmoteMeshPatch::identity(1, 1);
-        assert!((chain[0].control_points[5][0] - (identity.control_points[5][0] + 0.40)).abs() < 1.0e-6);
+        assert!((chain[0].patch.control_points[5][0] - (identity.control_points[5][0] + 0.40)).abs() < 1.0e-6);
     }
 
     #[test]
@@ -8268,7 +8322,7 @@ mod tests {
             uv_right: 1.0,
             uv_bottom: 1.0,
             mesh: None,
-            draw_frame_info: draw_frame_info(None, TravelContext::default()),
+            draw_frame_info: draw_frame_info(None, &TravelContext::default()),
         };
         let b = compute_bounds(&[sprite]).unwrap();
         assert_eq!(b.min_x, -10.0);
